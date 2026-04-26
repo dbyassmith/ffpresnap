@@ -310,6 +310,40 @@ def test_team_notes_dont_leak_into_player_notes(db):
     assert team_notes[0]["body"] == "team-level"
 
 
+def test_list_recent_notes_returns_chronological_feed(db):
+    db.replace_players([_player("1", full_name="Patrick Mahomes", team="KC")])
+    db.add_note("1", "first player note")
+    db.add_team_note("KC", "team note")
+    db.add_note("1", "latest player note")
+
+    feed = db.list_recent_notes()
+    bodies = [n["body"] for n in feed]
+    assert bodies == ["latest player note", "team note", "first player note"]
+
+    player_note = next(n for n in feed if n["body"] == "first player note")
+    assert player_note["subject"]["type"] == "player"
+    assert player_note["subject"]["full_name"] == "Patrick Mahomes"
+    assert player_note["subject"]["team"] == "KC"
+
+    team_note = next(n for n in feed if n["body"] == "team note")
+    assert team_note["subject"] == {
+        "type": "team",
+        "abbr": "KC",
+        "full_name": "Kansas City Chiefs",
+    }
+
+
+def test_list_recent_notes_respects_limit(db):
+    db.replace_players([_player("1")])
+    for i in range(5):
+        db.add_note("1", f"note {i}")
+    assert len(db.list_recent_notes(limit=3)) == 3
+
+
+def test_list_recent_notes_empty_when_no_notes(db):
+    assert db.list_recent_notes() == []
+
+
 def test_update_and_delete_works_across_note_types(db):
     db.replace_players([_player("1")])
     pn = db.add_note("1", "player")

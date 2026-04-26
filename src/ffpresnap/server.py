@@ -133,6 +133,20 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "list_recent_notes",
+        "description": (
+            "List notes across all players and teams in chronological order "
+            "(newest first), with subject info resolved. Optional `limit` "
+            "(default 50, max 200)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
         "name": "update_note",
         "description": "Replace the body of an existing note.",
         "inputSchema": {
@@ -207,6 +221,10 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
         if name == "list_team_notes":
             team = db.get_team(args["team"])
             return {"team": team, "notes": db.list_team_notes(team["abbr"])}
+        if name == "list_recent_notes":
+            limit = int(args.get("limit") or 50)
+            limit = max(1, min(limit, 200))
+            return db.list_recent_notes(limit=limit)
         if name == "update_note":
             return db.update_note(int(args["note_id"]), args["body"])
         if name == "delete_note":

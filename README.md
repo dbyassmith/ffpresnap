@@ -78,6 +78,7 @@ Notes:
 - `list_notes(player_id)` — newest first.
 - `add_team_note(team, body)` — attach a note to a team. `team` accepts abbr / full name / nickname.
 - `list_team_notes(team)` — newest first.
+- `list_recent_notes(limit?)` — chronological feed across all players and teams (default 50, max 200), with subject info resolved.
 - `update_note(note_id, body)` — replace a note's body (works for player and team notes).
 - `delete_note(note_id)` — delete a note (works for player and team notes).
 

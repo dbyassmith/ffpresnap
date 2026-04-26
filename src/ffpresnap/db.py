@@ -461,6 +461,46 @@ class Database:
         team = self.get_team(team_identifier)
         return self._list_notes("team", team["abbr"])
 
+    def list_recent_notes(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return notes across all players and teams, newest first, with subject
+        info resolved so callers can render a readable feed.
+        """
+        rows = self.conn.execute(
+            "SELECT n.*, "
+            "       p.full_name AS player_full_name, "
+            "       p.team      AS player_team, "
+            "       p.position  AS player_position, "
+            "       t.full_name AS team_full_name "
+            "FROM notes n "
+            "LEFT JOIN players p "
+            "       ON n.subject_type = 'player' AND n.subject_id = p.player_id "
+            "LEFT JOIN teams t "
+            "       ON n.subject_type = 'team'   AND n.subject_id = t.abbr "
+            "ORDER BY n.created_at DESC, n.id DESC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            note = _note_row(r)
+            if r["subject_type"] == "player":
+                note["subject"] = {
+                    "type": "player",
+                    "player_id": r["subject_id"],
+                    "full_name": r["player_full_name"],
+                    "team": r["player_team"],
+                    "position": r["player_position"],
+                }
+            else:
+                note["subject"] = {
+                    "type": "team",
+                    "abbr": r["subject_id"],
+                    "full_name": r["team_full_name"],
+                }
+            out.append(note)
+        return out
+
     def update_note(self, note_id: int, body: str) -> dict[str, Any]:
         cur = self.conn.execute(
             "UPDATE notes SET body = ?, updated_at = ? WHERE id = ?",

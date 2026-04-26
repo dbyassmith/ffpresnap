@@ -212,6 +212,25 @@ def test_team_notes_unknown_team_raises(synced_db):
         handle_tool_call(synced_db, "add_team_note", {"team": "Foobar", "body": "x"})
 
 
+def test_list_recent_notes_mixes_players_and_teams(synced_db):
+    handle_tool_call(synced_db, "add_note", {"player_id": "1", "body": "p1"})
+    handle_tool_call(synced_db, "add_team_note", {"team": "KC", "body": "t1"})
+    handle_tool_call(synced_db, "add_note", {"player_id": "4", "body": "p2"})
+
+    feed = handle_tool_call(synced_db, "list_recent_notes", {})
+    bodies = [n["body"] for n in feed]
+    assert bodies == ["p2", "t1", "p1"]
+    types = {n["subject"]["type"] for n in feed}
+    assert types == {"player", "team"}
+
+
+def test_list_recent_notes_limit_clamped(synced_db):
+    for i in range(5):
+        handle_tool_call(synced_db, "add_note", {"player_id": "1", "body": f"n{i}"})
+    feed = handle_tool_call(synced_db, "list_recent_notes", {"limit": 2})
+    assert len(feed) == 2
+
+
 def test_team_notes_do_not_appear_in_player_view(synced_db):
     handle_tool_call(
         synced_db, "add_team_note", {"team": "KC", "body": "team-level"}
