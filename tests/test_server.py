@@ -191,6 +191,37 @@ def test_add_note_missing_arg_raises(synced_db):
         handle_tool_call(synced_db, "add_note", {"player_id": "1"})
 
 
+# --- team notes ---
+
+
+def test_team_notes_round_trip(synced_db):
+    handle_tool_call(
+        synced_db, "add_team_note", {"team": "Chiefs", "body": "AFC West favorite"}
+    )
+    handle_tool_call(
+        synced_db, "add_team_note", {"team": "KC", "body": "Strong O-line"}
+    )
+    out = handle_tool_call(synced_db, "list_team_notes", {"team": "Kansas City Chiefs"})
+    assert out["team"]["abbr"] == "KC"
+    bodies = [n["body"] for n in out["notes"]]
+    assert bodies == ["Strong O-line", "AFC West favorite"]
+
+
+def test_team_notes_unknown_team_raises(synced_db):
+    with pytest.raises(ToolError, match="No team"):
+        handle_tool_call(synced_db, "add_team_note", {"team": "Foobar", "body": "x"})
+
+
+def test_team_notes_do_not_appear_in_player_view(synced_db):
+    handle_tool_call(
+        synced_db, "add_team_note", {"team": "KC", "body": "team-level"}
+    )
+    handle_tool_call(synced_db, "add_note", {"player_id": "1", "body": "player-level"})
+    player_view = handle_tool_call(synced_db, "get_player", {"player_id": "1"})
+    bodies = [n["body"] for n in player_view["notes"]]
+    assert bodies == ["player-level"]
+
+
 # --- removed tools ---
 
 

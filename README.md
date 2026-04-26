@@ -74,10 +74,12 @@ Browse:
 
 Notes:
 
-- `add_note(player_id, body)` — attach a note. `player_id` is the Sleeper id (string).
+- `add_note(player_id, body)` — attach a note to a player. `player_id` is the Sleeper id (string).
 - `list_notes(player_id)` — newest first.
-- `update_note(note_id, body)` — replace a note's body.
-- `delete_note(note_id)` — delete a note.
+- `add_team_note(team, body)` — attach a note to a team. `team` accepts abbr / full name / nickname.
+- `list_team_notes(team)` — newest first.
+- `update_note(note_id, body)` — replace a note's body (works for player and team notes).
+- `delete_note(note_id)` — delete a note (works for player and team notes).
 
 ## Data location
 

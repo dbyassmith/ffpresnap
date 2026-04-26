@@ -109,6 +109,30 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "add_team_note",
+        "description": (
+            "Attach a note to a team. `team` accepts an abbreviation, full name, or "
+            "unique nickname (e.g. 'KC', 'Kansas City Chiefs', 'Chiefs')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["team", "body"],
+        },
+    },
+    {
+        "name": "list_team_notes",
+        "description": "List notes for a team, newest first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"team": {"type": "string"}},
+            "required": ["team"],
+        },
+    },
+    {
         "name": "update_note",
         "description": "Replace the body of an existing note.",
         "inputSchema": {
@@ -178,6 +202,11 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
         if name == "list_notes":
             pid = str(args["player_id"])
             return {"player": db.get_player(pid), "notes": db.list_notes(pid)}
+        if name == "add_team_note":
+            return db.add_team_note(args["team"], args["body"])
+        if name == "list_team_notes":
+            team = db.get_team(args["team"])
+            return {"team": team, "notes": db.list_team_notes(team["abbr"])}
         if name == "update_note":
             return db.update_note(int(args["note_id"]), args["body"])
         if name == "delete_note":

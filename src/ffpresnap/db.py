@@ -9,7 +9,7 @@ from typing import Any
 from .teams import TEAMS
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class NotFoundError(Exception):
@@ -102,13 +102,14 @@ CREATE INDEX IF NOT EXISTS idx_players_name ON players(full_name COLLATE NOCASE)
 
 CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+  subject_type TEXT NOT NULL CHECK (subject_type IN ('player', 'team')),
+  subject_id TEXT NOT NULL,
   body TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_notes_player ON notes(player_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_subject ON notes(subject_type, subject_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS sync_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,7 +143,8 @@ def _player_row(row: sqlite3.Row) -> dict[str, Any]:
 def _note_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
-        "player_id": row["player_id"],
+        "subject_type": row["subject_type"],
+        "subject_id": row["subject_id"],
         "body": row["body"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -198,19 +200,47 @@ class Database:
             current = 0
 
         if current >= SCHEMA_VERSION:
-            # Ensure new tables exist on a partially-built DB but never touch existing rows.
             self.conn.executescript(SCHEMA_V2)
             self.conn.commit()
             return
 
-        # Upgrading from anything older than v2: drop legacy tables and rebuild.
-        self.conn.executescript(
-            """
-            DROP TABLE IF EXISTS notes;
-            DROP TABLE IF EXISTS players;
-            """
-        )
-        self.conn.executescript(SCHEMA_V2)
+        if current < 2:
+            # Pre-v2 (or fresh): drop legacy tables and rebuild from scratch.
+            self.conn.executescript(
+                """
+                DROP TABLE IF EXISTS notes;
+                DROP TABLE IF EXISTS players;
+                """
+            )
+            self.conn.executescript(SCHEMA_V2)
+        else:
+            # v2 -> v3: migrate notes to the polymorphic shape, preserving player notes.
+            self.conn.executescript(
+                """
+                ALTER TABLE notes RENAME TO notes_v2;
+
+                CREATE TABLE notes (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  subject_type TEXT NOT NULL CHECK (subject_type IN ('player', 'team')),
+                  subject_id TEXT NOT NULL,
+                  body TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
+                INSERT INTO notes (id, subject_type, subject_id, body, created_at, updated_at)
+                  SELECT id, 'player', player_id, body, created_at, updated_at FROM notes_v2;
+
+                DROP TABLE notes_v2;
+
+                CREATE INDEX IF NOT EXISTS idx_notes_subject
+                  ON notes(subject_type, subject_id, created_at DESC);
+                """
+            )
+            # Ensure any v2 peer tables (teams, sync_runs, indexes) that may be
+            # missing from a partially-built DB are created now.
+            self.conn.executescript(SCHEMA_V2)
+
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -314,16 +344,24 @@ class Database:
         )
         try:
             self.conn.execute("BEGIN")
-            # Drop only players absent from the new set so notes for surviving
-            # players are preserved. Use real UPSERT (not INSERT OR REPLACE) so
-            # updating an existing row does not cascade-delete its notes.
+            # Drop only players absent from the new set; explicitly delete their
+            # notes (notes table no longer has an FK cascade since it is polymorphic).
             if seen_ids:
                 marks = ",".join("?" for _ in seen_ids)
+                params = tuple(seen_ids)
+                self.conn.execute(
+                    f"DELETE FROM notes WHERE subject_type = 'player' "
+                    f"AND subject_id NOT IN ({marks})",
+                    params,
+                )
                 self.conn.execute(
                     f"DELETE FROM players WHERE player_id NOT IN ({marks})",
-                    tuple(seen_ids),
+                    params,
                 )
             else:
+                self.conn.execute(
+                    "DELETE FROM notes WHERE subject_type = 'player'"
+                )
                 self.conn.execute("DELETE FROM players")
             if prepared:
                 self.conn.executemany(upsert_sql, prepared)
@@ -386,13 +424,12 @@ class Database:
 
     # --- notes ---
 
-    def add_note(self, player_id: str, body: str) -> dict[str, Any]:
-        self.get_player(player_id)
+    def _add_note(self, subject_type: str, subject_id: str, body: str) -> dict[str, Any]:
         now = _now()
         cur = self.conn.execute(
-            "INSERT INTO notes (player_id, body, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?)",
-            (str(player_id), body, now, now),
+            "INSERT INTO notes (subject_type, subject_id, body, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (subject_type, subject_id, body, now, now),
         )
         self.conn.commit()
         row = self.conn.execute(
@@ -400,14 +437,29 @@ class Database:
         ).fetchone()
         return _note_row(row)
 
-    def list_notes(self, player_id: str) -> list[dict[str, Any]]:
-        self.get_player(player_id)
+    def _list_notes(self, subject_type: str, subject_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT * FROM notes WHERE player_id = ? "
+            "SELECT * FROM notes WHERE subject_type = ? AND subject_id = ? "
             "ORDER BY created_at DESC, id DESC",
-            (str(player_id),),
+            (subject_type, subject_id),
         ).fetchall()
         return [_note_row(r) for r in rows]
+
+    def add_note(self, player_id: str, body: str) -> dict[str, Any]:
+        self.get_player(player_id)
+        return self._add_note("player", str(player_id), body)
+
+    def list_notes(self, player_id: str) -> list[dict[str, Any]]:
+        self.get_player(player_id)
+        return self._list_notes("player", str(player_id))
+
+    def add_team_note(self, team_identifier: str, body: str) -> dict[str, Any]:
+        team = self.get_team(team_identifier)
+        return self._add_note("team", team["abbr"], body)
+
+    def list_team_notes(self, team_identifier: str) -> list[dict[str, Any]]:
+        team = self.get_team(team_identifier)
+        return self._list_notes("team", team["abbr"])
 
     def update_note(self, note_id: int, body: str) -> dict[str, Any]:
         cur = self.conn.execute(
