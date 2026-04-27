@@ -141,7 +141,7 @@ Claude will build an artifact with one card per dashboard prompt:
 | **Study Browser** | Browse open studies and drill into their notes |
 | **Depth Chart Explorer** | Pick a team, see depth chart grouped by position |
 | **Note Recency Feed** | Chronological feed of every note you've written |
-| **Player Card** | Detailed card for a single player + their notes/mentions |
+| **Player Explorer** | Search or browse a team's depth chart, drill into a player, compose notes |
 | **Team Overview** | Combined depth chart + team notes + mentions |
 | **Mention Graph** | Node-link graph of who-mentions-whom across notes |
 
