@@ -231,6 +231,182 @@ def test_list_recent_notes_limit_clamped(synced_db):
     assert len(feed) == 2
 
 
+# --- studies ---
+
+
+def test_create_list_get_study(synced_db):
+    s = handle_tool_call(
+        synced_db, "create_study", {"title": "RB Handcuffs", "description": "draft late"}
+    )
+    assert s["status"] == "open"
+    listed = handle_tool_call(synced_db, "list_studies", {})
+    assert any(x["id"] == s["id"] for x in listed)
+
+    out = handle_tool_call(synced_db, "get_study", {"study_id": s["id"]})
+    assert out["study"]["title"] == "RB Handcuffs"
+    assert out["notes"] == []
+    assert out["mentions"] == []
+
+
+def test_archive_unarchive_study(synced_db):
+    s = handle_tool_call(synced_db, "create_study", {"title": "x"})
+    handle_tool_call(synced_db, "archive_study", {"study_id": s["id"]})
+    open_only = handle_tool_call(synced_db, "list_studies", {})
+    assert all(x["id"] != s["id"] for x in open_only)
+    archived = handle_tool_call(synced_db, "list_studies", {"status": "archived"})
+    assert any(x["id"] == s["id"] for x in archived)
+    all_studies = handle_tool_call(synced_db, "list_studies", {"status": "all"})
+    assert any(x["id"] == s["id"] for x in all_studies)
+    handle_tool_call(synced_db, "unarchive_study", {"study_id": s["id"]})
+    open_again = handle_tool_call(synced_db, "list_studies", {})
+    assert any(x["id"] == s["id"] for x in open_again)
+
+
+def test_update_study(synced_db):
+    s = handle_tool_call(synced_db, "create_study", {"title": "old"})
+    updated = handle_tool_call(
+        synced_db, "update_study", {"study_id": s["id"], "title": "new"}
+    )
+    assert updated["title"] == "new"
+
+
+def test_delete_study_cascades(synced_db):
+    s = handle_tool_call(synced_db, "create_study", {"title": "doomed"})
+    handle_tool_call(synced_db, "add_study_note", {"study_id": s["id"], "body": "x"})
+    handle_tool_call(synced_db, "delete_study", {"study_id": s["id"]})
+    with pytest.raises(ToolError, match="not found"):
+        handle_tool_call(synced_db, "get_study", {"study_id": s["id"]})
+
+
+def test_get_study_unknown_raises(synced_db):
+    with pytest.raises(ToolError, match="not found"):
+        handle_tool_call(synced_db, "get_study", {"study_id": 9999})
+
+
+def test_add_study_note_with_mentions(synced_db):
+    s = handle_tool_call(synced_db, "create_study", {"title": "RB Handcuffs"})
+    note = handle_tool_call(
+        synced_db,
+        "add_study_note",
+        {
+            "study_id": s["id"],
+            "body": "Pacheco vs Hunt, KC backfield",
+            "mentions": {"player_ids": ["1", "2"], "team_abbrs": ["KC"]},
+        },
+    )
+    assert {p["player_id"] for p in note["mentions"]["players"]} == {"1", "2"}
+    assert [t["abbr"] for t in note["mentions"]["teams"]] == ["KC"]
+
+
+# --- mentions on existing tools ---
+
+
+def test_get_player_returns_notes_and_mentions_separately(synced_db):
+    handle_tool_call(synced_db, "add_note", {"player_id": "1", "body": "primary"})
+    handle_tool_call(
+        synced_db,
+        "add_note",
+        {"player_id": "4", "body": "mentions 1", "mentions": {"player_ids": ["1"]}},
+    )
+    out = handle_tool_call(synced_db, "get_player", {"player_id": "1"})
+    primary_bodies = [n["body"] for n in out["notes"]]
+    mention_bodies = [n["body"] for n in out["mentions"]]
+    assert primary_bodies == ["primary"]
+    assert mention_bodies == ["mentions 1"]
+
+
+def test_get_team_returns_notes_and_mentions(synced_db):
+    handle_tool_call(synced_db, "add_team_note", {"team": "KC", "body": "primary"})
+    handle_tool_call(
+        synced_db,
+        "add_note",
+        {"player_id": "4", "body": "mentions KC", "mentions": {"team_abbrs": ["KC"]}},
+    )
+    out = handle_tool_call(synced_db, "get_team", {"team": "Chiefs"})
+    assert out["team"]["abbr"] == "KC"
+    assert [n["body"] for n in out["notes"]] == ["primary"]
+    assert [n["body"] for n in out["mentions"]] == ["mentions KC"]
+
+
+def test_add_note_with_unknown_mention_raises(synced_db):
+    with pytest.raises(ToolError, match="player_id"):
+        handle_tool_call(
+            synced_db,
+            "add_note",
+            {"player_id": "1", "body": "x", "mentions": {"player_ids": ["nope"]}},
+        )
+
+
+def test_add_note_with_ambiguous_team_mention_raises(synced_db):
+    with pytest.raises(ToolError, match="ambiguous"):
+        handle_tool_call(
+            synced_db,
+            "add_note",
+            {"player_id": "1", "body": "x", "mentions": {"team_abbrs": ["New York"]}},
+        )
+
+
+def test_update_note_replaces_mentions(synced_db):
+    n = handle_tool_call(
+        synced_db,
+        "add_note",
+        {"player_id": "1", "body": "v1", "mentions": {"player_ids": ["2"]}},
+    )
+    updated = handle_tool_call(
+        synced_db,
+        "update_note",
+        {"note_id": n["id"], "body": "v2", "mentions": {"player_ids": ["4"]}},
+    )
+    assert [p["player_id"] for p in updated["mentions"]["players"]] == ["4"]
+
+
+def test_update_note_without_mentions_keeps_them(synced_db):
+    n = handle_tool_call(
+        synced_db,
+        "add_note",
+        {"player_id": "1", "body": "v1", "mentions": {"player_ids": ["2"]}},
+    )
+    updated = handle_tool_call(
+        synced_db, "update_note", {"note_id": n["id"], "body": "v2"}
+    )
+    assert [p["player_id"] for p in updated["mentions"]["players"]] == ["2"]
+
+
+# --- end-to-end agent flow ---
+
+
+def test_studies_and_mentions_full_flow(synced_db):
+    s = handle_tool_call(synced_db, "create_study", {"title": "RB Handcuffs"})
+    handle_tool_call(
+        synced_db,
+        "add_study_note",
+        {
+            "study_id": s["id"],
+            "body": "watch Pacheco backups",
+            "mentions": {"player_ids": ["1"], "team_abbrs": ["KC"]},
+        },
+    )
+    # Player view picks up the cross-reference under mentions.
+    pview = handle_tool_call(synced_db, "get_player", {"player_id": "1"})
+    assert pview["notes"] == []
+    assert any("Pacheco" in n["body"] for n in pview["mentions"])
+
+    # Team view picks it up too.
+    tview = handle_tool_call(synced_db, "get_team", {"team": "KC"})
+    assert any("Pacheco" in n["body"] for n in tview["mentions"])
+
+    # Recent feed includes the study note with mentions resolved.
+    feed = handle_tool_call(synced_db, "list_recent_notes", {})
+    study_note = feed[0]
+    assert study_note["subject"]["type"] == "study"
+    assert study_note["subject"]["title"] == "RB Handcuffs"
+    assert {p["player_id"] for p in study_note["mentions"]["players"]} == {"1"}
+
+    handle_tool_call(synced_db, "archive_study", {"study_id": s["id"]})
+    open_studies = handle_tool_call(synced_db, "list_studies", {})
+    assert all(x["id"] != s["id"] for x in open_studies)
+
+
 def test_team_notes_do_not_appear_in_player_view(synced_db):
     handle_tool_call(
         synced_db, "add_team_note", {"team": "KC", "body": "team-level"}

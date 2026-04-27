@@ -139,6 +139,86 @@ def test_v2_db_migrates_player_notes_to_polymorphic(tmp_path):
         db.close()
 
 
+def test_v3_db_migrates_to_v4_preserving_notes(tmp_path):
+    """A v3 DB should upgrade to v4 in place: notes survive (same id, body, subject),
+    studies + mentions tables exist, schema_version becomes 4, and the rebuilt
+    notes table now accepts subject_type='study'.
+    """
+    db_path = tmp_path / "v3.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '3');
+
+        CREATE TABLE players (
+          player_id TEXT PRIMARY KEY,
+          full_name TEXT,
+          team TEXT,
+          position TEXT,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO players (player_id, full_name, team, position, updated_at)
+          VALUES ('99', 'Carryover', 'KC', 'QB', '2026-04-01T00:00:00+00:00');
+
+        CREATE TABLE teams (
+          abbr TEXT PRIMARY KEY,
+          full_name TEXT NOT NULL,
+          conference TEXT NOT NULL,
+          division TEXT NOT NULL
+        );
+
+        CREATE TABLE notes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          subject_type TEXT NOT NULL CHECK (subject_type IN ('player', 'team')),
+          subject_id TEXT NOT NULL,
+          body TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO notes (id, subject_type, subject_id, body, created_at, updated_at)
+          VALUES
+            (1, 'player', '99', 'preserved player note',
+             '2026-04-01T00:00:00+00:00', '2026-04-01T00:00:00+00:00'),
+            (2, 'team',   'KC', 'preserved team note',
+             '2026-04-01T00:00:00+00:00', '2026-04-01T00:00:00+00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database.open(db_path)
+    try:
+        version = db.conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert int(version["value"]) == SCHEMA_VERSION
+
+        rows = db.conn.execute(
+            "SELECT id, subject_type, subject_id, body FROM notes ORDER BY id"
+        ).fetchall()
+        bodies = [(r["id"], r["subject_type"], r["subject_id"], r["body"]) for r in rows]
+        assert bodies == [
+            (1, "player", "99", "preserved player note"),
+            (2, "team", "KC", "preserved team note"),
+        ]
+
+        for table in ("studies", "note_player_mentions", "note_team_mentions"):
+            assert db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() is not None, f"missing table {table}"
+
+        # The rebuilt CHECK now allows subject_type='study'.
+        db.conn.execute(
+            "INSERT INTO notes (subject_type, subject_id, body, created_at, updated_at) "
+            "VALUES ('study', '1', 'sanity', '2026-04-26T00:00:00+00:00', '2026-04-26T00:00:00+00:00')"
+        )
+        db.conn.commit()
+    finally:
+        db.close()
+
+
 def test_legacy_v1_db_is_wiped_on_open(tmp_path):
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(str(db_path))
@@ -342,6 +422,247 @@ def test_list_recent_notes_respects_limit(db):
 
 def test_list_recent_notes_empty_when_no_notes(db):
     assert db.list_recent_notes() == []
+
+
+def test_list_recent_notes_attaches_mentions_and_covers_studies(db):
+    db.replace_players(
+        [_player("1", full_name="Mahomes"), _player("2", full_name="Allen", team="BUF")]
+    )
+    s = db.create_study("RB Handcuffs")
+    db.add_note("1", "p note", mentions={"player_ids": ["2"], "team_abbrs": ["BUF"]})
+    db.add_team_note("KC", "t note")
+    db.add_study_note(s["id"], "s note", mentions={"player_ids": ["1"]})
+
+    feed = db.list_recent_notes()
+    types = [n["subject"]["type"] for n in feed]
+    assert types == ["study", "team", "player"]
+
+    study_note = feed[0]
+    assert study_note["subject"]["title"] == "RB Handcuffs"
+    assert study_note["subject"]["status"] == "open"
+    assert [p["full_name"] for p in study_note["mentions"]["players"]] == ["Mahomes"]
+
+    player_note = feed[2]
+    assert [p["full_name"] for p in player_note["mentions"]["players"]] == ["Allen"]
+    assert [t["abbr"] for t in player_note["mentions"]["teams"]] == ["BUF"]
+
+    team_note = feed[1]
+    assert team_note["mentions"] == {"players": [], "teams": []}
+
+
+# --- studies ---
+
+
+def test_create_and_get_study(db):
+    s = db.create_study("RB Handcuffs", description="who to draft late")
+    assert s["id"] > 0
+    assert s["title"] == "RB Handcuffs"
+    assert s["status"] == "open"
+    assert s["description"] == "who to draft late"
+    assert db.get_study(s["id"]) == s
+
+
+def test_create_study_requires_title(db):
+    with pytest.raises(ValueError):
+        db.create_study("   ")
+
+
+def test_list_studies_default_open_only(db):
+    a = db.create_study("Open A")
+    b = db.create_study("Will archive")
+    db.set_study_status(b["id"], "archived")
+    open_ids = [s["id"] for s in db.list_studies()]
+    assert open_ids == [a["id"]]
+    archived_ids = [s["id"] for s in db.list_studies(status="archived")]
+    assert archived_ids == [b["id"]]
+    all_ids = {s["id"] for s in db.list_studies(status=None)}
+    assert all_ids == {a["id"], b["id"]}
+
+
+def test_update_study_partial(db):
+    s = db.create_study("Original")
+    updated = db.update_study(s["id"], title="Renamed")
+    assert updated["title"] == "Renamed"
+    assert updated["description"] == s["description"]
+    again = db.update_study(s["id"], description="now described")
+    assert again["title"] == "Renamed"
+    assert again["description"] == "now described"
+
+
+def test_update_study_no_args_is_noop(db):
+    s = db.create_study("Static")
+    assert db.update_study(s["id"]) == s
+
+
+def test_set_study_status_invalid_raises(db):
+    s = db.create_study("x")
+    with pytest.raises(ValueError):
+        db.set_study_status(s["id"], "closed")
+
+
+def test_get_study_unknown_raises(db):
+    with pytest.raises(NotFoundError):
+        db.get_study(9999)
+
+
+def test_delete_study_cascades_notes_and_mentions(db):
+    db.replace_players([_player("1")])
+    s = db.create_study("To delete")
+    n = db.add_study_note(s["id"], "note body", mentions={"player_ids": ["1"]})
+    db.delete_study(s["id"])
+    with pytest.raises(NotFoundError):
+        db.get_study(s["id"])
+    # The note row is gone.
+    row = db.conn.execute("SELECT * FROM notes WHERE id = ?", (n["id"],)).fetchone()
+    assert row is None
+    # And its mention rows are gone (FK cascade from notes).
+    rows = db.conn.execute(
+        "SELECT * FROM note_player_mentions WHERE note_id = ?", (n["id"],)
+    ).fetchall()
+    assert rows == []
+
+
+def test_add_study_note_unknown_study_raises(db):
+    with pytest.raises(NotFoundError):
+        db.add_study_note(9999, "x")
+
+
+# --- mentions on player/team notes ---
+
+
+def test_add_note_with_mentions(db):
+    db.replace_players(
+        [
+            _player("1", full_name="Mahomes"),
+            _player("2", full_name="Allen", team="BUF"),
+        ]
+    )
+    note = db.add_note(
+        "1",
+        "compare arms",
+        mentions={"player_ids": ["2"], "team_abbrs": ["Buffalo Bills"]},
+    )
+    # Team identifier is permissive; stored value is canonical abbr.
+    assert [p["full_name"] for p in note["mentions"]["players"]] == ["Allen"]
+    assert [t["abbr"] for t in note["mentions"]["teams"]] == ["BUF"]
+
+
+def test_add_note_dedupes_mentions(db):
+    db.replace_players([_player("1"), _player("2")])
+    note = db.add_note(
+        "1", "x", mentions={"player_ids": ["2", "2", "2"], "team_abbrs": ["KC", "KC"]}
+    )
+    assert len(note["mentions"]["players"]) == 1
+    assert len(note["mentions"]["teams"]) == 1
+
+
+def test_add_note_unknown_mention_rolls_back(db):
+    db.replace_players([_player("1")])
+    before = db.list_notes("1")
+    with pytest.raises(NotFoundError):
+        db.add_note("1", "x", mentions={"player_ids": ["nope"]})
+    assert db.list_notes("1") == before
+
+
+def test_add_note_unknown_team_mention_rolls_back(db):
+    db.replace_players([_player("1")])
+    with pytest.raises(NotFoundError):
+        db.add_note("1", "x", mentions={"team_abbrs": ["Foobar"]})
+    assert db.list_notes("1") == []
+
+
+def test_add_note_ambiguous_team_mention_rolls_back(db):
+    from ffpresnap.db import AmbiguousTeamError
+
+    db.replace_players([_player("1")])
+    with pytest.raises(AmbiguousTeamError):
+        db.add_note("1", "x", mentions={"team_abbrs": ["New York"]})
+    assert db.list_notes("1") == []
+
+
+def test_team_note_with_mentions(db):
+    db.replace_players([_player("1", full_name="Mahomes")])
+    note = db.add_team_note("KC", "preview", mentions={"player_ids": ["1"]})
+    assert [p["full_name"] for p in note["mentions"]["players"]] == ["Mahomes"]
+
+
+def test_update_note_replaces_mentions(db):
+    db.replace_players(
+        [_player("1", full_name="A"), _player("2", full_name="B"), _player("3", full_name="C")]
+    )
+    n = db.add_note("1", "v1", mentions={"player_ids": ["2"]})
+    updated = db.update_note(n["id"], "v2", mentions={"player_ids": ["3"]})
+    assert [p["full_name"] for p in updated["mentions"]["players"]] == ["C"]
+
+
+def test_update_note_without_mentions_leaves_them(db):
+    db.replace_players([_player("1"), _player("2")])
+    n = db.add_note("1", "v1", mentions={"player_ids": ["2"]})
+    updated = db.update_note(n["id"], "v2")
+    assert [p["player_id"] for p in updated["mentions"]["players"]] == ["2"]
+
+
+def test_update_note_empty_mentions_clears(db):
+    db.replace_players([_player("1"), _player("2")])
+    n = db.add_note("1", "v1", mentions={"player_ids": ["2"]})
+    updated = db.update_note(
+        n["id"], "v2", mentions={"player_ids": [], "team_abbrs": []}
+    )
+    assert updated["mentions"] == {"players": [], "teams": []}
+
+
+def test_update_note_invalid_mention_does_not_change_note(db):
+    db.replace_players([_player("1"), _player("2")])
+    n = db.add_note("1", "before", mentions={"player_ids": ["2"]})
+    with pytest.raises(NotFoundError):
+        db.update_note(n["id"], "after", mentions={"player_ids": ["nope"]})
+    # Body and mentions unchanged.
+    rows = db.list_notes("1")
+    assert rows[0]["body"] == "before"
+    assert [p["player_id"] for p in rows[0]["mentions"]["players"]] == ["2"]
+
+
+def test_list_player_mentions_excludes_primary_subject(db):
+    db.replace_players([_player("1"), _player("2")])
+    primary = db.add_note("1", "about player 1")
+    cross = db.add_note("2", "mentions 1", mentions={"player_ids": ["1"]})
+    mentions = db.list_player_mentions("1")
+    ids = [n["id"] for n in mentions]
+    assert cross["id"] in ids
+    assert primary["id"] not in ids
+
+
+def test_list_team_mentions_excludes_primary_subject(db):
+    db.replace_players([_player("1")])
+    primary = db.add_team_note("KC", "about KC")
+    cross = db.add_note("1", "mentions KC", mentions={"team_abbrs": ["KC"]})
+    mentions = db.list_team_mentions("KC")
+    ids = [n["id"] for n in mentions]
+    assert cross["id"] in ids
+    assert primary["id"] not in ids
+
+
+def test_player_removal_cascades_mentions(db):
+    db.replace_players([_player("1"), _player("2")])
+    db.add_note("1", "x", mentions={"player_ids": ["2"]})
+    db.replace_players([_player("1")])  # drop player 2
+    # The note about player 1 still exists, but its mention of player 2 is gone.
+    notes = db.list_notes("1")
+    assert notes[0]["mentions"]["players"] == []
+
+
+def test_note_delete_cleans_mention_rows(db):
+    db.replace_players([_player("1"), _player("2")])
+    n = db.add_note("1", "x", mentions={"player_ids": ["2"], "team_abbrs": ["KC"]})
+    db.delete_note(n["id"])
+    rows = db.conn.execute(
+        "SELECT * FROM note_player_mentions WHERE note_id = ?", (n["id"],)
+    ).fetchall()
+    assert rows == []
+    rows = db.conn.execute(
+        "SELECT * FROM note_team_mentions WHERE note_id = ?", (n["id"],)
+    ).fetchall()
+    assert rows == []
 
 
 def test_update_and_delete_works_across_note_types(db):

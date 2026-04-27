@@ -88,13 +88,22 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "add_note",
         "description": (
-            "Attach a note to a player. `player_id` is the Sleeper player id (string)."
+            "Attach a note to a player. `player_id` is the Sleeper player id (string). "
+            "Optional `mentions` lets you tag other players and teams referenced in "
+            "the note body so this note shows up under those subjects' `mentions` lists."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "player_id": {"type": "string"},
                 "body": {"type": "string"},
+                "mentions": {
+                    "type": "object",
+                    "properties": {
+                        "player_ids": {"type": "array", "items": {"type": "string"}},
+                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
             },
             "required": ["player_id", "body"],
         },
@@ -112,13 +121,21 @@ TOOLS: list[dict[str, Any]] = [
         "name": "add_team_note",
         "description": (
             "Attach a note to a team. `team` accepts an abbreviation, full name, or "
-            "unique nickname (e.g. 'KC', 'Kansas City Chiefs', 'Chiefs')."
+            "unique nickname (e.g. 'KC', 'Kansas City Chiefs', 'Chiefs'). Optional "
+            "`mentions` tags other players and teams referenced in the note."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "team": {"type": "string"},
                 "body": {"type": "string"},
+                "mentions": {
+                    "type": "object",
+                    "properties": {
+                        "player_ids": {"type": "array", "items": {"type": "string"}},
+                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
             },
             "required": ["team", "body"],
         },
@@ -130,6 +147,130 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {"team": {"type": "string"}},
             "required": ["team"],
+        },
+    },
+    {
+        "name": "get_team",
+        "description": (
+            "Return a team record along with two note lists: `notes` (where the team "
+            "is the primary subject) and `mentions` (notes elsewhere that tag this team)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"team": {"type": "string"}},
+            "required": ["team"],
+        },
+    },
+    {
+        "name": "create_study",
+        "description": (
+            "Create a research study (a named container you can attach many notes to). "
+            "Status defaults to 'open'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["title"],
+        },
+    },
+    {
+        "name": "list_studies",
+        "description": (
+            "List studies. `status` defaults to 'open'; pass 'archived' or 'all' to "
+            "include archived studies."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["open", "archived", "all"]},
+            },
+        },
+    },
+    {
+        "name": "get_study",
+        "description": (
+            "Return a study with its notes (primary subject) and `mentions` (notes "
+            "elsewhere that tag this study; currently always empty since studies "
+            "are not a mention target)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"study_id": {"type": "integer"}},
+            "required": ["study_id"],
+        },
+    },
+    {
+        "name": "update_study",
+        "description": "Update a study's title and/or description. Status is changed via archive/unarchive.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "study_id": {"type": "integer"},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["study_id"],
+        },
+    },
+    {
+        "name": "archive_study",
+        "description": "Archive a study so it stops appearing in the default list.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"study_id": {"type": "integer"}},
+            "required": ["study_id"],
+        },
+    },
+    {
+        "name": "unarchive_study",
+        "description": "Move an archived study back to 'open'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"study_id": {"type": "integer"}},
+            "required": ["study_id"],
+        },
+    },
+    {
+        "name": "delete_study",
+        "description": "Delete a study and all of its notes (cascades).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"study_id": {"type": "integer"}},
+            "required": ["study_id"],
+        },
+    },
+    {
+        "name": "add_study_note",
+        "description": (
+            "Attach a note to a study. Optional `mentions` tags players and teams "
+            "referenced in the note body."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "study_id": {"type": "integer"},
+                "body": {"type": "string"},
+                "mentions": {
+                    "type": "object",
+                    "properties": {
+                        "player_ids": {"type": "array", "items": {"type": "string"}},
+                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "required": ["study_id", "body"],
+        },
+    },
+    {
+        "name": "list_study_notes",
+        "description": "List notes attached to a study, newest first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"study_id": {"type": "integer"}},
+            "required": ["study_id"],
         },
     },
     {
@@ -148,12 +289,22 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "update_note",
-        "description": "Replace the body of an existing note.",
+        "description": (
+            "Replace the body of an existing note. Optional `mentions` replaces the "
+            "stored mention set wholesale; omit it to leave mentions unchanged."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "note_id": {"type": "integer"},
                 "body": {"type": "string"},
+                "mentions": {
+                    "type": "object",
+                    "properties": {
+                        "player_ids": {"type": "array", "items": {"type": "string"}},
+                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
             },
             "required": ["note_id", "body"],
         },
@@ -208,25 +359,78 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
             return db.find_players(args["query"], limit=10)
         if name == "get_player":
             pid = str(args["player_id"])
-            return {"player": db.get_player(pid), "notes": db.list_notes(pid)}
+            return {
+                "player": db.get_player(pid),
+                "notes": db.list_notes(pid),
+                "mentions": db.list_player_mentions(pid),
+            }
         if name == "list_players":
             return db.list_players(team=args.get("team"), position=args.get("position"))
         if name == "add_note":
-            return db.add_note(str(args["player_id"]), args["body"])
+            return db.add_note(
+                str(args["player_id"]), args["body"], mentions=args.get("mentions")
+            )
         if name == "list_notes":
             pid = str(args["player_id"])
             return {"player": db.get_player(pid), "notes": db.list_notes(pid)}
         if name == "add_team_note":
-            return db.add_team_note(args["team"], args["body"])
+            return db.add_team_note(
+                args["team"], args["body"], mentions=args.get("mentions")
+            )
         if name == "list_team_notes":
             team = db.get_team(args["team"])
             return {"team": team, "notes": db.list_team_notes(team["abbr"])}
+        if name == "get_team":
+            team = db.get_team(args["team"])
+            return {
+                "team": team,
+                "notes": db.list_team_notes(team["abbr"]),
+                "mentions": db.list_team_mentions(team["abbr"]),
+            }
+        if name == "create_study":
+            return db.create_study(args["title"], description=args.get("description"))
+        if name == "list_studies":
+            status = args.get("status", "open")
+            if status == "all":
+                status = None
+            return db.list_studies(status=status)
+        if name == "get_study":
+            sid = int(args["study_id"])
+            study = db.get_study(sid)
+            return {
+                "study": study,
+                "notes": db.list_study_notes(sid),
+                "mentions": [],  # studies are not currently a mention target
+            }
+        if name == "update_study":
+            return db.update_study(
+                int(args["study_id"]),
+                title=args.get("title"),
+                description=args.get("description"),
+            )
+        if name == "archive_study":
+            return db.set_study_status(int(args["study_id"]), "archived")
+        if name == "unarchive_study":
+            return db.set_study_status(int(args["study_id"]), "open")
+        if name == "delete_study":
+            sid = int(args["study_id"])
+            db.delete_study(sid)
+            return {"ok": True, "deleted_study_id": sid}
+        if name == "add_study_note":
+            return db.add_study_note(
+                int(args["study_id"]), args["body"], mentions=args.get("mentions")
+            )
+        if name == "list_study_notes":
+            sid = int(args["study_id"])
+            return {"study": db.get_study(sid), "notes": db.list_study_notes(sid)}
         if name == "list_recent_notes":
             limit = int(args.get("limit") or 50)
             limit = max(1, min(limit, 200))
             return db.list_recent_notes(limit=limit)
         if name == "update_note":
-            return db.update_note(int(args["note_id"]), args["body"])
+            return db.update_note(
+                int(args["note_id"]), args["body"], mentions=args.get("mentions")
+            )
         if name == "delete_note":
             db.delete_note(int(args["note_id"]))
             return {"ok": True, "deleted_note_id": int(args["note_id"])}

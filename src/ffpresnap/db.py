@@ -9,7 +9,7 @@ from typing import Any
 from .teams import TEAMS
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class NotFoundError(Exception):
@@ -102,7 +102,7 @@ CREATE INDEX IF NOT EXISTS idx_players_name ON players(full_name COLLATE NOCASE)
 
 CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  subject_type TEXT NOT NULL CHECK (subject_type IN ('player', 'team')),
+  subject_type TEXT NOT NULL CHECK (subject_type IN ('player', 'team', 'study')),
   subject_id TEXT NOT NULL,
   body TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -110,6 +110,33 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notes_subject ON notes(subject_type, subject_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS studies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL CHECK (status IN ('open', 'archived')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_studies_status ON studies(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS note_player_mentions (
+  note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+  player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+  PRIMARY KEY (note_id, player_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_npm_player ON note_player_mentions(player_id);
+
+CREATE TABLE IF NOT EXISTS note_team_mentions (
+  note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+  team_abbr TEXT NOT NULL REFERENCES teams(abbr),
+  PRIMARY KEY (note_id, team_abbr)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ntm_team ON note_team_mentions(team_abbr);
 
 CREATE TABLE IF NOT EXISTS sync_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +176,19 @@ def _note_row(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def _study_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "description": row["description"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 
 
 def _sync_run_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -213,8 +253,12 @@ class Database:
                 """
             )
             self.conn.executescript(SCHEMA_V2)
-        else:
-            # v2 -> v3: migrate notes to the polymorphic shape, preserving player notes.
+            self._set_schema_version(SCHEMA_VERSION)
+            self.conn.commit()
+            return
+
+        # v2 -> v3: migrate notes to the polymorphic (subject_type, subject_id) shape.
+        if current < 3:
             self.conn.executescript(
                 """
                 ALTER TABLE notes RENAME TO notes_v2;
@@ -237,16 +281,41 @@ class Database:
                   ON notes(subject_type, subject_id, created_at DESC);
                 """
             )
-            # Ensure any v2 peer tables (teams, sync_runs, indexes) that may be
-            # missing from a partially-built DB are created now.
-            self.conn.executescript(SCHEMA_V2)
 
+        # v3 -> v4: rebuild notes to extend subject_type CHECK to include 'study',
+        # and create the studies + mentions tables.
+        if current < 4:
+            self.conn.executescript(
+                """
+                ALTER TABLE notes RENAME TO notes_v3;
+
+                CREATE TABLE notes (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  subject_type TEXT NOT NULL CHECK (subject_type IN ('player', 'team', 'study')),
+                  subject_id TEXT NOT NULL,
+                  body TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
+                INSERT INTO notes (id, subject_type, subject_id, body, created_at, updated_at)
+                  SELECT id, subject_type, subject_id, body, created_at, updated_at FROM notes_v3;
+
+                DROP TABLE notes_v3;
+                """
+            )
+
+        # Ensure all v4 peer tables and indexes exist.
+        self.conn.executescript(SCHEMA_V2)
+        self._set_schema_version(SCHEMA_VERSION)
+        self.conn.commit()
+
+    def _set_schema_version(self, version: int) -> None:
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(SCHEMA_VERSION),),
+            (str(version),),
         )
-        self.conn.commit()
 
     def _seed_teams(self) -> None:
         self.conn.executemany(
@@ -424,18 +493,142 @@ class Database:
 
     # --- notes ---
 
-    def _add_note(self, subject_type: str, subject_id: str, body: str) -> dict[str, Any]:
+    def _resolve_mentions(
+        self, mentions: dict[str, Any] | None
+    ) -> tuple[list[str], list[str]]:
+        """Return (player_ids, team_abbrs) lists, validated and deduped.
+
+        Raises NotFoundError on unknown player_id or unknown team identifier.
+        Raises AmbiguousTeamError on ambiguous team identifier.
+        """
+        if not mentions:
+            return [], []
+        raw_player_ids = mentions.get("player_ids") or []
+        raw_team_ids = mentions.get("team_abbrs") or []
+
+        # Dedupe while preserving caller order.
+        seen: set[str] = set()
+        player_ids: list[str] = []
+        for pid in raw_player_ids:
+            spid = str(pid)
+            if spid not in seen:
+                seen.add(spid)
+                player_ids.append(spid)
+
+        if player_ids:
+            marks = ",".join("?" for _ in player_ids)
+            rows = self.conn.execute(
+                f"SELECT player_id FROM players WHERE player_id IN ({marks})",
+                tuple(player_ids),
+            ).fetchall()
+            found = {r["player_id"] for r in rows}
+            missing = [p for p in player_ids if p not in found]
+            if missing:
+                raise NotFoundError(f"Unknown mentioned player_id(s): {missing}")
+
+        team_abbrs: list[str] = []
+        seen_abbrs: set[str] = set()
+        for ident in raw_team_ids:
+            team = self.get_team(ident)  # may raise NotFound / Ambiguous
+            if team["abbr"] not in seen_abbrs:
+                seen_abbrs.add(team["abbr"])
+                team_abbrs.append(team["abbr"])
+
+        return player_ids, team_abbrs
+
+    def _write_mentions(
+        self, note_id: int, player_ids: list[str], team_abbrs: list[str]
+    ) -> None:
+        if player_ids:
+            self.conn.executemany(
+                "INSERT INTO note_player_mentions (note_id, player_id) VALUES (?, ?)",
+                [(note_id, pid) for pid in player_ids],
+            )
+        if team_abbrs:
+            self.conn.executemany(
+                "INSERT INTO note_team_mentions (note_id, team_abbr) VALUES (?, ?)",
+                [(note_id, abbr) for abbr in team_abbrs],
+            )
+
+    def _load_mentions_for(
+        self, note_ids: list[int]
+    ) -> dict[int, dict[str, list[dict[str, Any]]]]:
+        """Batched mention load. Returns {note_id: {"players": [...], "teams": [...]}}."""
+        if not note_ids:
+            return {}
+        out: dict[int, dict[str, list[dict[str, Any]]]] = {
+            nid: {"players": [], "teams": []} for nid in note_ids
+        }
+        marks = ",".join("?" for _ in note_ids)
+
+        prows = self.conn.execute(
+            f"SELECT npm.note_id, p.player_id, p.full_name, p.team, p.position "
+            f"FROM note_player_mentions npm "
+            f"JOIN players p ON p.player_id = npm.player_id "
+            f"WHERE npm.note_id IN ({marks}) "
+            f"ORDER BY p.full_name COLLATE NOCASE",
+            tuple(note_ids),
+        ).fetchall()
+        for r in prows:
+            out[r["note_id"]]["players"].append(
+                {
+                    "player_id": r["player_id"],
+                    "full_name": r["full_name"],
+                    "team": r["team"],
+                    "position": r["position"],
+                }
+            )
+
+        trows = self.conn.execute(
+            f"SELECT ntm.note_id, t.abbr, t.full_name "
+            f"FROM note_team_mentions ntm "
+            f"JOIN teams t ON t.abbr = ntm.team_abbr "
+            f"WHERE ntm.note_id IN ({marks}) "
+            f"ORDER BY t.full_name COLLATE NOCASE",
+            tuple(note_ids),
+        ).fetchall()
+        for r in trows:
+            out[r["note_id"]]["teams"].append(
+                {"abbr": r["abbr"], "full_name": r["full_name"]}
+            )
+        return out
+
+    def _attach_mentions(self, notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not notes:
+            return notes
+        loaded = self._load_mentions_for([n["id"] for n in notes])
+        for n in notes:
+            n["mentions"] = loaded.get(n["id"], {"players": [], "teams": []})
+        return notes
+
+    def _add_note(
+        self,
+        subject_type: str,
+        subject_id: str,
+        body: str,
+        mentions: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        player_ids, team_abbrs = self._resolve_mentions(mentions)
         now = _now()
-        cur = self.conn.execute(
-            "INSERT INTO notes (subject_type, subject_id, body, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (subject_type, subject_id, body, now, now),
-        )
-        self.conn.commit()
+        try:
+            self.conn.execute("BEGIN")
+            cur = self.conn.execute(
+                "INSERT INTO notes (subject_type, subject_id, body, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (subject_type, subject_id, body, now, now),
+            )
+            note_id = int(cur.lastrowid)
+            self._write_mentions(note_id, player_ids, team_abbrs)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         row = self.conn.execute(
-            "SELECT * FROM notes WHERE id = ?", (cur.lastrowid,)
+            "SELECT * FROM notes WHERE id = ?", (note_id,)
         ).fetchone()
-        return _note_row(row)
+        note = _note_row(row)
+        note["mentions"] = self._load_mentions_for([note_id])[note_id]
+        return note
 
     def _list_notes(self, subject_type: str, subject_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -443,23 +636,170 @@ class Database:
             "ORDER BY created_at DESC, id DESC",
             (subject_type, subject_id),
         ).fetchall()
-        return [_note_row(r) for r in rows]
+        return self._attach_mentions([_note_row(r) for r in rows])
 
-    def add_note(self, player_id: str, body: str) -> dict[str, Any]:
+    def _list_mention_notes(
+        self, target_type: str, target_id: str
+    ) -> list[dict[str, Any]]:
+        """Notes that mention the given player or team but are NOT primarily about it."""
+        if target_type == "player":
+            rows = self.conn.execute(
+                "SELECT n.* FROM notes n "
+                "JOIN note_player_mentions m ON m.note_id = n.id "
+                "WHERE m.player_id = ? "
+                "  AND NOT (n.subject_type = 'player' AND n.subject_id = ?) "
+                "ORDER BY n.created_at DESC, n.id DESC",
+                (target_id, target_id),
+            ).fetchall()
+        elif target_type == "team":
+            rows = self.conn.execute(
+                "SELECT n.* FROM notes n "
+                "JOIN note_team_mentions m ON m.note_id = n.id "
+                "WHERE m.team_abbr = ? "
+                "  AND NOT (n.subject_type = 'team' AND n.subject_id = ?) "
+                "ORDER BY n.created_at DESC, n.id DESC",
+                (target_id, target_id),
+            ).fetchall()
+        else:
+            return []
+        return self._attach_mentions([_note_row(r) for r in rows])
+
+    def add_note(
+        self, player_id: str, body: str, mentions: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         self.get_player(player_id)
-        return self._add_note("player", str(player_id), body)
+        return self._add_note("player", str(player_id), body, mentions)
 
     def list_notes(self, player_id: str) -> list[dict[str, Any]]:
         self.get_player(player_id)
         return self._list_notes("player", str(player_id))
 
-    def add_team_note(self, team_identifier: str, body: str) -> dict[str, Any]:
+    def list_player_mentions(self, player_id: str) -> list[dict[str, Any]]:
+        self.get_player(player_id)
+        return self._list_mention_notes("player", str(player_id))
+
+    def add_team_note(
+        self, team_identifier: str, body: str, mentions: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         team = self.get_team(team_identifier)
-        return self._add_note("team", team["abbr"], body)
+        return self._add_note("team", team["abbr"], body, mentions)
 
     def list_team_notes(self, team_identifier: str) -> list[dict[str, Any]]:
         team = self.get_team(team_identifier)
         return self._list_notes("team", team["abbr"])
+
+    def list_team_mentions(self, team_identifier: str) -> list[dict[str, Any]]:
+        team = self.get_team(team_identifier)
+        return self._list_mention_notes("team", team["abbr"])
+
+    # --- studies ---
+
+    def create_study(
+        self, title: str, description: str | None = None
+    ) -> dict[str, Any]:
+        if not title or not title.strip():
+            raise ValueError("Study title is required")
+        now = _now()
+        cur = self.conn.execute(
+            "INSERT INTO studies (title, description, status, created_at, updated_at) "
+            "VALUES (?, ?, 'open', ?, ?)",
+            (title.strip(), description, now, now),
+        )
+        self.conn.commit()
+        return self.get_study(int(cur.lastrowid))
+
+    def get_study(self, study_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM studies WHERE id = ?", (int(study_id),)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Study {study_id} not found")
+        return _study_row(row)
+
+    def list_studies(self, status: str | None = "open") -> list[dict[str, Any]]:
+        if status is None:
+            rows = self.conn.execute(
+                "SELECT * FROM studies ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+        else:
+            if status not in ("open", "archived"):
+                raise ValueError(f"Invalid status: {status!r}")
+            rows = self.conn.execute(
+                "SELECT * FROM studies WHERE status = ? "
+                "ORDER BY updated_at DESC, id DESC",
+                (status,),
+            ).fetchall()
+        return [_study_row(r) for r in rows]
+
+    def update_study(
+        self,
+        study_id: int,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_study(study_id)
+        sets = []
+        params: list[Any] = []
+        if title is not None:
+            if not title.strip():
+                raise ValueError("Study title cannot be empty")
+            sets.append("title = ?")
+            params.append(title.strip())
+        if description is not None:
+            sets.append("description = ?")
+            params.append(description)
+        if not sets:
+            return self.get_study(study_id)
+        sets.append("updated_at = ?")
+        params.append(_now())
+        params.append(int(study_id))
+        self.conn.execute(
+            f"UPDATE studies SET {', '.join(sets)} WHERE id = ?", tuple(params)
+        )
+        self.conn.commit()
+        return self.get_study(study_id)
+
+    def set_study_status(self, study_id: int, status: str) -> dict[str, Any]:
+        if status not in ("open", "archived"):
+            raise ValueError(f"Invalid status: {status!r}")
+        self.get_study(study_id)
+        self.conn.execute(
+            "UPDATE studies SET status = ?, updated_at = ? WHERE id = ?",
+            (status, _now(), int(study_id)),
+        )
+        self.conn.commit()
+        return self.get_study(study_id)
+
+    def delete_study(self, study_id: int) -> None:
+        self.get_study(study_id)
+        try:
+            self.conn.execute("BEGIN")
+            self.conn.execute(
+                "DELETE FROM notes WHERE subject_type = 'study' AND subject_id = ?",
+                (str(study_id),),
+            )
+            self.conn.execute(
+                "DELETE FROM studies WHERE id = ?", (int(study_id),)
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def add_study_note(
+        self,
+        study_id: int,
+        body: str,
+        mentions: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.get_study(study_id)
+        return self._add_note("study", str(study_id), body, mentions)
+
+    def list_study_notes(self, study_id: int) -> list[dict[str, Any]]:
+        self.get_study(study_id)
+        return self._list_notes("study", str(study_id))
+
+    # --- recent notes feed ---
 
     def list_recent_notes(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return notes across all players and teams, newest first, with subject
@@ -470,12 +810,16 @@ class Database:
             "       p.full_name AS player_full_name, "
             "       p.team      AS player_team, "
             "       p.position  AS player_position, "
-            "       t.full_name AS team_full_name "
+            "       t.full_name AS team_full_name, "
+            "       s.title     AS study_title, "
+            "       s.status    AS study_status "
             "FROM notes n "
             "LEFT JOIN players p "
             "       ON n.subject_type = 'player' AND n.subject_id = p.player_id "
             "LEFT JOIN teams t "
             "       ON n.subject_type = 'team'   AND n.subject_id = t.abbr "
+            "LEFT JOIN studies s "
+            "       ON n.subject_type = 'study'  AND n.subject_id = CAST(s.id AS TEXT) "
             "ORDER BY n.created_at DESC, n.id DESC "
             "LIMIT ?",
             (limit,),
@@ -492,25 +836,62 @@ class Database:
                     "team": r["player_team"],
                     "position": r["player_position"],
                 }
-            else:
+            elif r["subject_type"] == "team":
                 note["subject"] = {
                     "type": "team",
                     "abbr": r["subject_id"],
                     "full_name": r["team_full_name"],
                 }
+            else:
+                note["subject"] = {
+                    "type": "study",
+                    "study_id": int(r["subject_id"]),
+                    "title": r["study_title"],
+                    "status": r["study_status"],
+                }
             out.append(note)
-        return out
+        return self._attach_mentions(out)
 
-    def update_note(self, note_id: int, body: str) -> dict[str, Any]:
-        cur = self.conn.execute(
-            "UPDATE notes SET body = ?, updated_at = ? WHERE id = ?",
-            (body, _now(), note_id),
-        )
-        self.conn.commit()
-        if cur.rowcount == 0:
-            raise NotFoundError(f"Note {note_id} not found")
+    def update_note(
+        self,
+        note_id: int,
+        body: str,
+        mentions: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # Resolve mentions before opening the transaction so a bad mention
+        # doesn't leave a half-updated note.
+        resolved: tuple[list[str], list[str]] | None = None
+        if mentions is not None:
+            resolved = self._resolve_mentions(mentions)
+
+        try:
+            self.conn.execute("BEGIN")
+            cur = self.conn.execute(
+                "UPDATE notes SET body = ?, updated_at = ? WHERE id = ?",
+                (body, _now(), note_id),
+            )
+            if cur.rowcount == 0:
+                self.conn.rollback()
+                raise NotFoundError(f"Note {note_id} not found")
+            if resolved is not None:
+                player_ids, team_abbrs = resolved
+                self.conn.execute(
+                    "DELETE FROM note_player_mentions WHERE note_id = ?", (note_id,)
+                )
+                self.conn.execute(
+                    "DELETE FROM note_team_mentions WHERE note_id = ?", (note_id,)
+                )
+                self._write_mentions(note_id, player_ids, team_abbrs)
+            self.conn.commit()
+        except NotFoundError:
+            raise
+        except Exception:
+            self.conn.rollback()
+            raise
         row = self.conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
-        return _note_row(row)
+        note = _note_row(row)
+        note["mentions"] = self._load_mentions_for([note_id])[note_id]
+        return note
 
     def delete_note(self, note_id: int) -> None:
         cur = self.conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
