@@ -139,6 +139,50 @@ def test_v2_db_migrates_player_notes_to_polymorphic(tmp_path):
         db.close()
 
 
+def test_v4_db_migrates_to_v5_preserving_data(tmp_path):
+    """A v4 DB should upgrade to v5 in place: existing data untouched, the new
+    `prompts` table exists, and schema_version becomes 5.
+    """
+    db_path = tmp_path / "v4.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '4');
+        CREATE TABLE notes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          subject_type TEXT NOT NULL CHECK (subject_type IN ('player', 'team', 'study')),
+          subject_id TEXT NOT NULL,
+          body TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO notes (subject_type, subject_id, body, created_at, updated_at)
+          VALUES ('team', 'KC', 'preserved', '2026-04-01T00:00:00+00:00', '2026-04-01T00:00:00+00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database.open(db_path)
+    try:
+        version = db.conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert int(version["value"]) == SCHEMA_VERSION
+
+        rows = db.conn.execute(
+            "SELECT body FROM notes WHERE subject_type='team' AND subject_id='KC'"
+        ).fetchall()
+        assert [r["body"] for r in rows] == ["preserved"]
+
+        assert db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='prompts'"
+        ).fetchone() is not None
+    finally:
+        db.close()
+
+
 def test_v3_db_migrates_to_v4_preserving_notes(tmp_path):
     """A v3 DB should upgrade to v4 in place: notes survive (same id, body, subject),
     studies + mentions tables exist, schema_version becomes 4, and the rebuilt
@@ -649,6 +693,78 @@ def test_player_removal_cascades_mentions(db):
     # The note about player 1 still exists, but its mention of player 2 is gone.
     notes = db.list_notes("1")
     assert notes[0]["mentions"]["players"] == []
+
+
+# --- prompts ---
+
+
+def _fake_prompt(slug, body="body"):
+    return {
+        "slug": slug,
+        "title": slug.replace("-", " ").title(),
+        "description": f"{slug} description",
+        "body": body,
+    }
+
+
+def test_seed_prompts_inserts_from_loader(db):
+    db._seed_prompts(loader=lambda: [_fake_prompt("alpha"), _fake_prompt("beta")])
+    rows = db.list_prompts()
+    assert {r["slug"] for r in rows} == {"alpha", "beta"}
+
+
+def test_seed_prompts_is_idempotent(db):
+    loader = lambda: [_fake_prompt("alpha")]
+    db._seed_prompts(loader=loader)
+    db._seed_prompts(loader=loader)
+    rows = db.list_prompts()
+    assert [r["slug"] for r in rows] == ["alpha"]
+
+
+def test_seed_prompts_updates_changed_body(db):
+    db._seed_prompts(loader=lambda: [_fake_prompt("alpha", body="v1")])
+    db._seed_prompts(loader=lambda: [_fake_prompt("alpha", body="v2")])
+    rows = db.list_prompts()
+    assert rows[0]["body"] == "v2"
+
+
+def test_seed_prompts_removes_dropped_slugs(db):
+    db._seed_prompts(
+        loader=lambda: [_fake_prompt("alpha"), _fake_prompt("beta")]
+    )
+    db._seed_prompts(loader=lambda: [_fake_prompt("alpha")])
+    rows = db.list_prompts()
+    assert [r["slug"] for r in rows] == ["alpha"]
+
+
+def test_seed_prompts_empty_loader_clears_table(db):
+    db._seed_prompts(loader=lambda: [_fake_prompt("alpha")])
+    db._seed_prompts(loader=lambda: [])
+    assert db.list_prompts() == []
+
+
+def test_seed_prompts_propagates_loader_errors(db):
+    def bad_loader():
+        raise ValueError("malformed prompt")
+
+    with pytest.raises(ValueError, match="malformed"):
+        db._seed_prompts(loader=bad_loader)
+
+
+def test_list_prompts_orders_show_prompt_library_first(db):
+    db._seed_prompts(
+        loader=lambda: [
+            _fake_prompt("study-browser"),
+            _fake_prompt("show-prompt-library"),
+            _fake_prompt("depth-chart-explorer"),
+        ]
+    )
+    rows = db.list_prompts()
+    assert [r["slug"] for r in rows] == [
+        "show-prompt-library",
+        "depth-chart-explorer",
+        "study-browser",
+    ]
 
 
 def test_note_delete_cleans_mention_rows(db):

@@ -241,6 +241,18 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["note_id"],
         },
     },
+    # --- prompt library ---
+    {
+        "name": "list_prompts",
+        "description": (
+            "Return the prompt library: a curated catalog of canned prompts that "
+            "direct Claude to build dashboard artifacts (study browser, depth chart "
+            "explorer, note feed, etc.). Each item has slug, title, description, and "
+            "body. The agent is expected to render the result as an artifact with one "
+            "card per prompt and a copy-to-clipboard button per card."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -388,6 +400,8 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
         if name == "delete_note":
             db.delete_note(int(args["note_id"]))
             return {"ok": True, "deleted_note_id": int(args["note_id"])}
+        if name == "list_prompts":
+            return db.list_prompts()
     except AmbiguousTeamError as e:
         candidates = "\n".join(
             f"  - {m['abbr']} ({m['full_name']})" for m in e.matches

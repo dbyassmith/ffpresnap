@@ -33,6 +33,22 @@ You can also invoke `sync_players` from inside Claude. Sleeper recommends pollin
 
 Sync filters to fantasy-relevant positions (QB, RB, WR, TE, K, DEF). Each run is recorded; ask Claude to call `last_sync` to see when it last ran.
 
+## Bootstrap the prompt library
+
+Once the MCP is connected, paste the following into Claude. Claude will call `list_prompts` and render an artifact with one card per canned prompt (study browser, depth chart explorer, note feed, player card, team overview, mention graph, and a self-referential "show prompt library"). Click "Copy prompt" on any card, paste it into a new chat with this MCP connected, and Claude will build the requested dashboard.
+
+```text
+Build me a Claude artifact that displays the ffpresnap prompt library.
+
+Step 1. Call the MCP tool `list_prompts` (no arguments).
+
+Step 2. Embed the JSON result directly into the artifact source as a JavaScript constant — the artifact is a snapshot, not a live fetch. To refresh it later, ask Claude to regenerate the artifact.
+
+Step 3. Render the prompts as a responsive card grid. Each card shows the prompt's `title` as the heading, the `description` as a one-line subhead, and a "Copy prompt" button that calls `navigator.clipboard.writeText(prompt.body)` and briefly shows "Copied!" in place of the button label.
+```
+
+(The same prompt is also stored as the `show-prompt-library` library entry, so once the artifact is open the user can re-summon it from inside.)
+
 ## Configure Claude
 
 **Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -90,6 +106,10 @@ Notes (unified):
 - `delete_note(note_id)` — delete a note.
 
 **Mentions.** `add_note` and `update_note` accept an optional `mentions: { player_ids: [...], team_abbrs: [...] }`. Mentions are explicit (Claude passes them in the tool call) and validated at write time — an unknown player or unresolvable team rejects the whole write. From a player or team's view, notes that tag them appear in the `mentions` list, separate from notes written *about* them.
+
+Prompt library:
+
+- `list_prompts()` — return the curated catalog of canned prompts that direct Claude to build dashboard artifacts. Prompts ship with the package and are reconciled into the local DB on every open (repo is source of truth — local edits get overwritten). See "Bootstrap the prompt library" above.
 
 ## Data location
 

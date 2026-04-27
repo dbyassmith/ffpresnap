@@ -434,6 +434,36 @@ def test_delete_note(synced_db):
 # --- removed legacy tools ---
 
 
+# --- prompt library ---
+
+
+def test_list_prompts_tool_returns_seeded_prompts(synced_db):
+    synced_db._seed_prompts(
+        loader=lambda: [
+            {
+                "slug": "show-prompt-library",
+                "title": "Show Library",
+                "description": "Re-open the library.",
+                "body": "Call list_prompts and render an artifact.",
+            },
+            {
+                "slug": "study-browser",
+                "title": "Study Browser",
+                "description": "Browse studies.",
+                "body": "Call list_studies and render cards.",
+            },
+        ]
+    )
+    result = handle_tool_call(synced_db, "list_prompts", {})
+    assert [p["slug"] for p in result] == ["show-prompt-library", "study-browser"]
+    assert all({"slug", "title", "description", "body"} <= set(p) for p in result)
+
+
+def test_list_prompts_tool_empty(db):
+    db._seed_prompts(loader=lambda: [])
+    assert handle_tool_call(db, "list_prompts", {}) == []
+
+
 def test_legacy_tools_are_unknown(db):
     for name in (
         "add_team_note",

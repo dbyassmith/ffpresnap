@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import prompt_loader
 from .teams import TEAMS
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class NotFoundError(Exception):
@@ -147,6 +148,14 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   status TEXT NOT NULL,
   error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS prompts (
+  slug TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  body TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -210,6 +219,7 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._migrate()
         self._seed_teams()
+        self._seed_prompts()
 
     @classmethod
     def open(cls, path: str | Path | None = None) -> "Database":
@@ -282,6 +292,11 @@ class Database:
                 """
             )
 
+        # v4 -> v5 is purely additive (the `prompts` table). The
+        # executescript(SCHEMA_V2) call below creates it; this arm exists for
+        # symmetry and to make schema-version progression observable in tests.
+        # (Empty body intentional.)
+
         # v3 -> v4: rebuild notes to extend subject_type CHECK to include 'study',
         # and create the studies + mentions tables.
         if current < 4:
@@ -324,6 +339,42 @@ class Database:
             TEAMS,
         )
         self.conn.commit()
+
+    def _seed_prompts(self, loader=None) -> None:
+        """Reconcile prompts from the repo into the DB.
+
+        Repo is source of truth: upserts each prompt by slug, deletes rows whose
+        slug is no longer present in the repo. Atomic.
+        """
+        load = loader if loader is not None else prompt_loader.load_prompts
+        prompts = load()
+        now = _now()
+        try:
+            self.conn.execute("BEGIN")
+            for p in prompts:
+                self.conn.execute(
+                    "INSERT INTO prompts (slug, title, description, body, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(slug) DO UPDATE SET "
+                    "  title = excluded.title, "
+                    "  description = excluded.description, "
+                    "  body = excluded.body, "
+                    "  updated_at = excluded.updated_at",
+                    (p["slug"], p["title"], p["description"], p["body"], now),
+                )
+            slugs = [p["slug"] for p in prompts]
+            if slugs:
+                marks = ",".join("?" for _ in slugs)
+                self.conn.execute(
+                    f"DELETE FROM prompts WHERE slug NOT IN ({marks})",
+                    tuple(slugs),
+                )
+            else:
+                self.conn.execute("DELETE FROM prompts")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     # --- teams ---
 
@@ -798,6 +849,23 @@ class Database:
     def list_study_notes(self, study_id: int) -> list[dict[str, Any]]:
         self.get_study(study_id)
         return self._list_notes("study", str(study_id))
+
+    # --- prompts ---
+
+    def list_prompts(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT slug, title, description, body FROM prompts "
+            "ORDER BY (CASE slug WHEN 'show-prompt-library' THEN 0 ELSE 1 END), slug"
+        ).fetchall()
+        return [
+            {
+                "slug": r["slug"],
+                "title": r["title"],
+                "description": r["description"],
+                "body": r["body"],
+            }
+            for r in rows
+        ]
 
     # --- recent notes feed ---
 
