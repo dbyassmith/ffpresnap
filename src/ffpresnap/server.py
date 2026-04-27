@@ -10,7 +10,17 @@ from .sleeper import SleeperFetchError
 from .sync import run_sync
 
 
+_MENTIONS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "player_ids": {"type": "array", "items": {"type": "string"}},
+        "team_abbrs": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
 TOOLS: list[dict[str, Any]] = [
+    # --- sync ---
     {
         "name": "sync_players",
         "description": (
@@ -24,6 +34,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return the most recent sync run, or null if none has run yet.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    # --- browse ---
     {
         "name": "list_teams",
         "description": (
@@ -36,12 +47,23 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_team",
+        "description": (
+            "Return a team record along with two note lists: `notes` (where the team "
+            "is the primary subject) and `mentions` (notes elsewhere that tag this team). "
+            "`team` accepts abbr, full name, or unique nickname (e.g. 'KC', 'Chiefs')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"team": {"type": "string"}},
+            "required": ["team"],
+        },
+    },
+    {
         "name": "get_depth_chart",
         "description": (
-            "Return a team's depth chart. `team` accepts an abbreviation (e.g. 'KC'), "
-            "full name ('Kansas City Chiefs'), or unique nickname ('Chiefs'). "
-            "Players are grouped by depth_chart_position; unranked players are returned "
-            "in a trailing 'Unranked' group."
+            "Return a team's depth chart, grouped by depth_chart_position. Unranked "
+            "players land in a trailing 'Unranked' group."
         ),
         "inputSchema": {
             "type": "object",
@@ -51,9 +73,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "find_player",
-        "description": (
-            "Search players by case-insensitive name substring. Returns up to 10 matches."
-        ),
+        "description": "Search players by case-insensitive name substring (max 10).",
         "inputSchema": {
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -63,8 +83,8 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_player",
         "description": (
-            "Return full detail for a player along with their notes (newest first). "
-            "`player_id` is the Sleeper player id (string)."
+            "Return full player detail with two note lists: `notes` (about this "
+            "player) and `mentions` (notes elsewhere that tag this player)."
         ),
         "inputSchema": {
             "type": "object",
@@ -74,9 +94,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "list_players",
-        "description": (
-            "List players, optionally filtered by `team` (abbreviation) and/or `position`."
-        ),
+        "description": "List players, optionally filtered by `team` (abbr) and/or `position`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -85,82 +103,7 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "name": "add_note",
-        "description": (
-            "Attach a note to a player. `player_id` is the Sleeper player id (string). "
-            "Optional `mentions` lets you tag other players and teams referenced in "
-            "the note body so this note shows up under those subjects' `mentions` lists."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "player_id": {"type": "string"},
-                "body": {"type": "string"},
-                "mentions": {
-                    "type": "object",
-                    "properties": {
-                        "player_ids": {"type": "array", "items": {"type": "string"}},
-                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "required": ["player_id", "body"],
-        },
-    },
-    {
-        "name": "list_notes",
-        "description": "List notes for a player, newest first.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"player_id": {"type": "string"}},
-            "required": ["player_id"],
-        },
-    },
-    {
-        "name": "add_team_note",
-        "description": (
-            "Attach a note to a team. `team` accepts an abbreviation, full name, or "
-            "unique nickname (e.g. 'KC', 'Kansas City Chiefs', 'Chiefs'). Optional "
-            "`mentions` tags other players and teams referenced in the note."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "team": {"type": "string"},
-                "body": {"type": "string"},
-                "mentions": {
-                    "type": "object",
-                    "properties": {
-                        "player_ids": {"type": "array", "items": {"type": "string"}},
-                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "required": ["team", "body"],
-        },
-    },
-    {
-        "name": "list_team_notes",
-        "description": "List notes for a team, newest first.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"team": {"type": "string"}},
-            "required": ["team"],
-        },
-    },
-    {
-        "name": "get_team",
-        "description": (
-            "Return a team record along with two note lists: `notes` (where the team "
-            "is the primary subject) and `mentions` (notes elsewhere that tag this team)."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"team": {"type": "string"}},
-            "required": ["team"],
-        },
-    },
+    # --- studies ---
     {
         "name": "create_study",
         "description": (
@@ -179,8 +122,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_studies",
         "description": (
-            "List studies. `status` defaults to 'open'; pass 'archived' or 'all' to "
-            "include archived studies."
+            "List studies. `status` defaults to 'open'; pass 'archived' or 'all'."
         ),
         "inputSchema": {
             "type": "object",
@@ -191,11 +133,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_study",
-        "description": (
-            "Return a study with its notes (primary subject) and `mentions` (notes "
-            "elsewhere that tag this study; currently always empty since studies "
-            "are not a mention target)."
-        ),
+        "description": "Return a study with its notes (newest first).",
         "inputSchema": {
             "type": "object",
             "properties": {"study_id": {"type": "integer"}},
@@ -204,7 +142,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "update_study",
-        "description": "Update a study's title and/or description. Status is changed via archive/unarchive.",
+        "description": "Update a study's title and/or description.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -216,21 +154,15 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "archive_study",
-        "description": "Archive a study so it stops appearing in the default list.",
+        "name": "set_study_status",
+        "description": "Set a study's status to 'open' or 'archived'.",
         "inputSchema": {
             "type": "object",
-            "properties": {"study_id": {"type": "integer"}},
-            "required": ["study_id"],
-        },
-    },
-    {
-        "name": "unarchive_study",
-        "description": "Move an archived study back to 'open'.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"study_id": {"type": "integer"}},
-            "required": ["study_id"],
+            "properties": {
+                "study_id": {"type": "integer"},
+                "status": {"type": "string", "enum": ["open", "archived"]},
+            },
+            "required": ["study_id", "status"],
         },
     },
     {
@@ -242,49 +174,46 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["study_id"],
         },
     },
+    # --- notes (unified) ---
     {
-        "name": "add_study_note",
+        "name": "add_note",
         "description": (
-            "Attach a note to a study. Optional `mentions` tags players and teams "
-            "referenced in the note body."
+            "Attach a note to a subject. `target_type` is 'player', 'team', or 'study'. "
+            "`target_id` is the Sleeper player_id (string), team identifier "
+            "(abbr/name/nickname), or study id (integer-as-string). Optional "
+            "`mentions` tags other players and teams referenced in the note body."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "study_id": {"type": "integer"},
+                "target_type": {"type": "string", "enum": ["player", "team", "study"]},
+                "target_id": {"type": "string"},
                 "body": {"type": "string"},
-                "mentions": {
-                    "type": "object",
-                    "properties": {
-                        "player_ids": {"type": "array", "items": {"type": "string"}},
-                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
+                "mentions": _MENTIONS_SCHEMA,
             },
-            "required": ["study_id", "body"],
+            "required": ["target_type", "target_id", "body"],
         },
     },
     {
-        "name": "list_study_notes",
-        "description": "List notes attached to a study, newest first.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"study_id": {"type": "integer"}},
-            "required": ["study_id"],
-        },
-    },
-    {
-        "name": "list_recent_notes",
+        "name": "list_notes",
         "description": (
-            "List notes across all players and teams in chronological order "
-            "(newest first), with subject info resolved. Optional `limit` "
-            "(default 50, max 200)."
+            "List notes. `scope` selects the source: 'player', 'team', and 'study' "
+            "list primary-subject notes for the given `target_id`; 'recent' returns "
+            "a chronological feed across all subjects. `limit` (default 50, max 200) "
+            "applies to 'recent' only. Notes always include their `mentions` block; "
+            "'recent' entries also carry a `subject` block resolving the type."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["player", "team", "study", "recent"],
+                },
+                "target_id": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
             },
+            "required": ["scope"],
         },
     },
     {
@@ -298,13 +227,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "note_id": {"type": "integer"},
                 "body": {"type": "string"},
-                "mentions": {
-                    "type": "object",
-                    "properties": {
-                        "player_ids": {"type": "array", "items": {"type": "string"}},
-                        "team_abbrs": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
+                "mentions": _MENTIONS_SCHEMA,
             },
             "required": ["note_id", "body"],
         },
@@ -340,6 +263,54 @@ def _group_depth_chart(players: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _add_note_dispatch(
+    db: Database,
+    target_type: str,
+    target_id: str,
+    body: str,
+    mentions: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if target_type == "player":
+        return db.add_note(str(target_id), body, mentions=mentions)
+    if target_type == "team":
+        return db.add_team_note(str(target_id), body, mentions=mentions)
+    if target_type == "study":
+        try:
+            sid = int(target_id)
+        except (TypeError, ValueError) as e:
+            raise ToolError(
+                f"target_id for study must be an integer, got {target_id!r}"
+            ) from e
+        return db.add_study_note(sid, body, mentions=mentions)
+    raise ToolError(f"Unknown target_type: {target_type!r}")
+
+
+def _list_notes_dispatch(
+    db: Database, scope: str, target_id: str | None, limit: int | None
+) -> Any:
+    if scope == "recent":
+        eff = int(limit if limit is not None else 50)
+        eff = max(1, min(eff, 200))
+        return db.list_recent_notes(limit=eff)
+    if target_id is None:
+        raise ToolError(f"target_id is required when scope is {scope!r}")
+    if scope == "player":
+        pid = str(target_id)
+        return {"player": db.get_player(pid), "notes": db.list_notes(pid)}
+    if scope == "team":
+        team = db.get_team(target_id)
+        return {"team": team, "notes": db.list_team_notes(team["abbr"])}
+    if scope == "study":
+        try:
+            sid = int(target_id)
+        except (TypeError, ValueError) as e:
+            raise ToolError(
+                f"target_id for study must be an integer, got {target_id!r}"
+            ) from e
+        return {"study": db.get_study(sid), "notes": db.list_study_notes(sid)}
+    raise ToolError(f"Unknown scope: {scope!r}")
+
+
 def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
     """Pure dispatch over tool name. Raises ToolError on user-facing failures."""
     args = args or {}
@@ -350,9 +321,15 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
             return db.last_sync()
         if name == "list_teams":
             return db.list_teams(args.get("query"))
+        if name == "get_team":
+            team = db.get_team(args["team"])
+            return {
+                "team": team,
+                "notes": db.list_team_notes(team["abbr"]),
+                "mentions": db.list_team_mentions(team["abbr"]),
+            }
         if name == "get_depth_chart":
-            team_query = args["team"]
-            team = db.get_team(team_query)
+            team = db.get_team(args["team"])
             players = db.depth_chart(team["abbr"])
             return {"team": team, "groups": _group_depth_chart(players)}
         if name == "find_player":
@@ -366,27 +343,6 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
             }
         if name == "list_players":
             return db.list_players(team=args.get("team"), position=args.get("position"))
-        if name == "add_note":
-            return db.add_note(
-                str(args["player_id"]), args["body"], mentions=args.get("mentions")
-            )
-        if name == "list_notes":
-            pid = str(args["player_id"])
-            return {"player": db.get_player(pid), "notes": db.list_notes(pid)}
-        if name == "add_team_note":
-            return db.add_team_note(
-                args["team"], args["body"], mentions=args.get("mentions")
-            )
-        if name == "list_team_notes":
-            team = db.get_team(args["team"])
-            return {"team": team, "notes": db.list_team_notes(team["abbr"])}
-        if name == "get_team":
-            team = db.get_team(args["team"])
-            return {
-                "team": team,
-                "notes": db.list_team_notes(team["abbr"]),
-                "mentions": db.list_team_mentions(team["abbr"]),
-            }
         if name == "create_study":
             return db.create_study(args["title"], description=args.get("description"))
         if name == "list_studies":
@@ -396,11 +352,10 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
             return db.list_studies(status=status)
         if name == "get_study":
             sid = int(args["study_id"])
-            study = db.get_study(sid)
             return {
-                "study": study,
+                "study": db.get_study(sid),
                 "notes": db.list_study_notes(sid),
-                "mentions": [],  # studies are not currently a mention target
+                "mentions": [],
             }
         if name == "update_study":
             return db.update_study(
@@ -408,25 +363,24 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
                 title=args.get("title"),
                 description=args.get("description"),
             )
-        if name == "archive_study":
-            return db.set_study_status(int(args["study_id"]), "archived")
-        if name == "unarchive_study":
-            return db.set_study_status(int(args["study_id"]), "open")
+        if name == "set_study_status":
+            return db.set_study_status(int(args["study_id"]), args["status"])
         if name == "delete_study":
             sid = int(args["study_id"])
             db.delete_study(sid)
             return {"ok": True, "deleted_study_id": sid}
-        if name == "add_study_note":
-            return db.add_study_note(
-                int(args["study_id"]), args["body"], mentions=args.get("mentions")
+        if name == "add_note":
+            return _add_note_dispatch(
+                db,
+                args["target_type"],
+                args["target_id"],
+                args["body"],
+                args.get("mentions"),
             )
-        if name == "list_study_notes":
-            sid = int(args["study_id"])
-            return {"study": db.get_study(sid), "notes": db.list_study_notes(sid)}
-        if name == "list_recent_notes":
-            limit = int(args.get("limit") or 50)
-            limit = max(1, min(limit, 200))
-            return db.list_recent_notes(limit=limit)
+        if name == "list_notes":
+            return _list_notes_dispatch(
+                db, args["scope"], args.get("target_id"), args.get("limit")
+            )
         if name == "update_note":
             return db.update_note(
                 int(args["note_id"]), args["body"], mentions=args.get("mentions")

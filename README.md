@@ -79,21 +79,17 @@ Studies (research containers):
 - `list_studies(status?)` — defaults to open; pass `"archived"` or `"all"`.
 - `get_study(study_id)` — study record plus its notes.
 - `update_study(study_id, title?, description?)` — partial update.
-- `archive_study(study_id)` / `unarchive_study(study_id)` — toggle status.
+- `set_study_status(study_id, status)` — `"open"` or `"archived"`.
 - `delete_study(study_id)` — deletes the study and all of its notes (cascades).
-- `add_study_note(study_id, body, mentions?)` / `list_study_notes(study_id)` — attach and list notes on a study.
 
-Notes:
+Notes (unified):
 
-- `add_note(player_id, body)` — attach a note to a player. `player_id` is the Sleeper id (string).
-- `list_notes(player_id)` — newest first.
-- `add_team_note(team, body)` — attach a note to a team. `team` accepts abbr / full name / nickname.
-- `list_team_notes(team)` — newest first.
-- `list_recent_notes(limit?)` — chronological feed across all players and teams (default 50, max 200), with subject info resolved.
-- `update_note(note_id, body, mentions?)` — replace a note's body. If `mentions` is provided, the stored mention set is replaced wholesale; omit to leave mentions unchanged. Works for player, team, and study notes.
-- `delete_note(note_id)` — delete a note (works for player, team, and study notes).
+- `add_note(target_type, target_id, body, mentions?)` — `target_type` is `"player"`, `"team"`, or `"study"`. `target_id` is the player_id (string), team identifier (abbr / full name / nickname), or study id (as a string).
+- `list_notes(scope, target_id?, limit?)` — `scope` is `"player"`, `"team"`, `"study"`, or `"recent"`. The first three return primary-subject notes for the given `target_id`; `"recent"` returns a chronological feed across all subjects (default 50, max 200), with each entry carrying a `subject` block.
+- `update_note(note_id, body, mentions?)` — replace a note's body. If `mentions` is provided, the stored mention set is replaced wholesale; omit to leave mentions unchanged.
+- `delete_note(note_id)` — delete a note.
 
-**Mentions.** Every `add_*_note` and `update_note` accepts an optional `mentions: { player_ids: [...], team_abbrs: [...] }`. Mentions are explicit (Claude passes them in the tool call) and validated at write time — an unknown player or unresolvable team rejects the whole write. From a player or team's view, notes that tag them appear in the `mentions` list, separate from notes written *about* them.
+**Mentions.** `add_note` and `update_note` accept an optional `mentions: { player_ids: [...], team_abbrs: [...] }`. Mentions are explicit (Claude passes them in the tool call) and validated at write time — an unknown player or unresolvable team rejects the whole write. From a player or team's view, notes that tag them appear in the `mentions` list, separate from notes written *about* them.
 
 ## Data location
 
