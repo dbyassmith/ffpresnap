@@ -10,7 +10,7 @@ from . import prompt_loader
 from .teams import TEAMS
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class NotFoundError(Exception):
@@ -94,7 +94,8 @@ CREATE TABLE IF NOT EXISTS players (
   yahoo_id TEXT,
   rotowire_id TEXT,
   sportradar_id TEXT,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  watchlist INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team);
@@ -173,7 +174,9 @@ def _team_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _player_row(row: sqlite3.Row) -> dict[str, Any]:
-    return {field: row[field] for field in PLAYER_FIELDS}
+    out = {field: row[field] for field in PLAYER_FIELDS}
+    out["watchlist"] = bool(row["watchlist"])
+    return out
 
 
 def _note_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -291,6 +294,19 @@ class Database:
                   ON notes(subject_type, subject_id, created_at DESC);
                 """
             )
+
+        # v5 -> v6: add `watchlist INTEGER NOT NULL DEFAULT 0` to players. SQLite
+        # ALTER TABLE ADD COLUMN supports a DEFAULT, so existing rows get 0
+        # without a table rebuild. Sync's UPSERT excludes watchlist from its
+        # update set, preserving user toggles across re-syncs.
+        if current >= 4 and current < 6:
+            cols = self.conn.execute("PRAGMA table_info(players)").fetchall()
+            # Only ALTER if the players table exists already; if it doesn't,
+            # SCHEMA_V2 below creates it fresh with the watchlist column.
+            if cols and not any(c["name"] == "watchlist" for c in cols):
+                self.conn.execute(
+                    "ALTER TABLE players ADD COLUMN watchlist INTEGER NOT NULL DEFAULT 0"
+                )
 
         # v4 -> v5 is purely additive (the `prompts` table). The
         # executescript(SCHEMA_V2) call below creates it; this arm exists for
@@ -500,7 +516,10 @@ class Database:
         return _player_row(row)
 
     def list_players(
-        self, team: str | None = None, position: str | None = None
+        self,
+        team: str | None = None,
+        position: str | None = None,
+        watchlist: bool | None = None,
     ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -510,12 +529,24 @@ class Database:
         if position:
             clauses.append("position = ? COLLATE NOCASE")
             params.append(position)
+        if watchlist is not None:
+            clauses.append("watchlist = ?")
+            params.append(1 if watchlist else 0)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.conn.execute(
             f"SELECT * FROM players {where} ORDER BY full_name COLLATE NOCASE",
             tuple(params),
         ).fetchall()
         return [_player_row(r) for r in rows]
+
+    def set_watchlist(self, player_id: str, on: bool) -> dict[str, Any]:
+        self.get_player(player_id)
+        self.conn.execute(
+            "UPDATE players SET watchlist = ? WHERE player_id = ?",
+            (1 if on else 0, str(player_id)),
+        )
+        self.conn.commit()
+        return self.get_player(player_id)
 
     def find_players(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         rows = self.conn.execute(

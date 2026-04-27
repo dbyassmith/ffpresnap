@@ -139,6 +139,49 @@ def test_v2_db_migrates_player_notes_to_polymorphic(tmp_path):
         db.close()
 
 
+def test_v5_db_migrates_to_v6_adds_watchlist_column(tmp_path):
+    """Opening a v5 DB upgrades to v6 by adding `watchlist INTEGER NOT NULL
+    DEFAULT 0` to players. Existing rows get 0; existing data is otherwise
+    untouched.
+    """
+    db_path = tmp_path / "v5.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '5');
+        CREATE TABLE players (
+          player_id TEXT PRIMARY KEY,
+          full_name TEXT,
+          team TEXT,
+          position TEXT,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO players (player_id, full_name, team, position, updated_at)
+          VALUES ('99', 'Holdover', 'KC', 'QB', '2026-04-01T00:00:00+00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database.open(db_path)
+    try:
+        version = db.conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert int(version["value"]) == SCHEMA_VERSION
+
+        cols = db.conn.execute("PRAGMA table_info(players)").fetchall()
+        assert any(c["name"] == "watchlist" for c in cols), "watchlist column missing"
+
+        row = db.conn.execute(
+            "SELECT watchlist FROM players WHERE player_id = '99'"
+        ).fetchone()
+        assert row["watchlist"] == 0
+    finally:
+        db.close()
+
+
 def test_v4_db_migrates_to_v5_preserving_data(tmp_path):
     """A v4 DB should upgrade to v5 in place: existing data untouched, the new
     `prompts` table exists, and schema_version becomes 5.
@@ -693,6 +736,52 @@ def test_player_removal_cascades_mentions(db):
     # The note about player 1 still exists, but its mention of player 2 is gone.
     notes = db.list_notes("1")
     assert notes[0]["mentions"]["players"] == []
+
+
+# --- watchlist ---
+
+
+def test_new_player_defaults_to_watchlist_false(db):
+    db.replace_players([_player("1")])
+    p = db.get_player("1")
+    assert p["watchlist"] is False
+
+
+def test_set_watchlist_toggles(db):
+    db.replace_players([_player("1")])
+    on = db.set_watchlist("1", True)
+    assert on["watchlist"] is True
+    off = db.set_watchlist("1", False)
+    assert off["watchlist"] is False
+
+
+def test_set_watchlist_unknown_player_raises(db):
+    with pytest.raises(NotFoundError):
+        db.set_watchlist("nope", True)
+
+
+def test_watchlist_preserved_across_replace_players(db):
+    db.replace_players([_player("1", full_name="Original")])
+    db.set_watchlist("1", True)
+    # Sleeper sync re-runs with updated metadata; watchlist must survive.
+    db.replace_players([_player("1", full_name="Updated Name")])
+    p = db.get_player("1")
+    assert p["full_name"] == "Updated Name"
+    assert p["watchlist"] is True
+
+
+def test_list_players_watchlist_filter(db):
+    db.replace_players(
+        [_player("1", full_name="A"), _player("2", full_name="B"), _player("3", full_name="C")]
+    )
+    db.set_watchlist("1", True)
+    db.set_watchlist("3", True)
+    on = db.list_players(watchlist=True)
+    off = db.list_players(watchlist=False)
+    assert {p["player_id"] for p in on} == {"1", "3"}
+    assert {p["player_id"] for p in off} == {"2"}
+    # Unfiltered returns everyone.
+    assert len(db.list_players()) == 3
 
 
 # --- prompts ---

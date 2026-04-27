@@ -187,7 +187,8 @@ If you want to be precise (or look something up later), here are all 19 tools.
 - `get_depth_chart(team)` — depth chart grouped by position; unranked players land in a trailing `Unranked` group.
 - `find_player(query)` — case-insensitive name substring search (max 10).
 - `get_player(player_id)` — full player detail plus two lists: `notes` (about this player) and `mentions` (notes elsewhere that tag this player).
-- `list_players(team?, position?)` — flat listing with optional filters.
+- `list_players(team?, position?, watchlist?)` — flat listing with optional filters. Pass `watchlist: true` to show only watchlisted players.
+- `update_player(player_id, watchlist?)` — toggle a player's watchlist flag. The watchlist is preserved across Sleeper syncs.
 
 **Studies (research containers)**
 

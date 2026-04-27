@@ -434,6 +434,40 @@ def test_delete_note(synced_db):
 # --- removed legacy tools ---
 
 
+# --- watchlist ---
+
+
+def test_update_player_toggles_watchlist(synced_db):
+    p = handle_tool_call(
+        synced_db, "update_player", {"player_id": "1", "watchlist": True}
+    )
+    assert p["watchlist"] is True
+    p2 = handle_tool_call(
+        synced_db, "update_player", {"player_id": "1", "watchlist": False}
+    )
+    assert p2["watchlist"] is False
+
+
+def test_update_player_unknown_raises(synced_db):
+    with pytest.raises(ToolError, match="not found"):
+        handle_tool_call(
+            synced_db, "update_player", {"player_id": "nope", "watchlist": True}
+        )
+
+
+def test_list_players_watchlist_filter(synced_db):
+    handle_tool_call(synced_db, "update_player", {"player_id": "1", "watchlist": True})
+    handle_tool_call(synced_db, "update_player", {"player_id": "4", "watchlist": True})
+    on = handle_tool_call(synced_db, "list_players", {"watchlist": True})
+    assert {p["player_id"] for p in on} == {"1", "4"}
+
+
+def test_get_player_includes_watchlist(synced_db):
+    out = handle_tool_call(synced_db, "get_player", {"player_id": "1"})
+    assert "watchlist" in out["player"]
+    assert out["player"]["watchlist"] is False
+
+
 # --- prompt library ---
 
 

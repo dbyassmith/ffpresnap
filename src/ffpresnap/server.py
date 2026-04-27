@@ -94,13 +94,33 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "list_players",
-        "description": "List players, optionally filtered by `team` (abbr) and/or `position`.",
+        "description": (
+            "List players, optionally filtered by `team` (abbr), `position`, "
+            "and/or `watchlist` (true to show only watchlisted players)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "team": {"type": "string"},
                 "position": {"type": "string"},
+                "watchlist": {"type": "boolean"},
             },
+        },
+    },
+    {
+        "name": "update_player",
+        "description": (
+            "Update mutable, user-owned attributes on a player. Currently only "
+            "`watchlist` (boolean). Sleeper-sourced fields are not editable here — "
+            "they reconcile from Sleeper on every sync."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "player_id": {"type": "string"},
+                "watchlist": {"type": "boolean"},
+            },
+            "required": ["player_id"],
         },
     },
     # --- studies ---
@@ -354,7 +374,16 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
                 "mentions": db.list_player_mentions(pid),
             }
         if name == "list_players":
-            return db.list_players(team=args.get("team"), position=args.get("position"))
+            return db.list_players(
+                team=args.get("team"),
+                position=args.get("position"),
+                watchlist=args.get("watchlist"),
+            )
+        if name == "update_player":
+            pid = str(args["player_id"])
+            if "watchlist" in args:
+                db.set_watchlist(pid, bool(args["watchlist"]))
+            return db.get_player(pid)
         if name == "create_study":
             return db.create_study(args["title"], description=args.get("description"))
         if name == "list_studies":
