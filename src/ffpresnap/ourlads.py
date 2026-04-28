@@ -39,16 +39,56 @@ DEFAULT_TIMEOUT = 30.0
 DEFAULT_DELAY_SECONDS = 1.5
 DEFAULT_RETRY_BACKOFF_SECONDS = 3.0
 
+# Position filtering: Ourlads pages list every player on the roster (DL, OL,
+# LB, DB, special teams, etc.). The rest of ffpresnap is fantasy-shaped, so
+# we drop non-fantasy rows at parse time to keep the players table clean and
+# identity-mergeable with Sleeper. Sleeper uses position='K' for kickers;
+# Ourlads uses 'PK' — we normalize to K so identity matching works.
+
+# Roster page keep set (from `position` cell). Note: Ourlads writes 'PK',
+# Sleeper writes 'K'; both map to fantasy 'K'.
+_ROSTER_FANTASY_POSITIONS: frozenset[str] = frozenset(
+    {"QB", "RB", "WR", "TE", "K", "PK"}
+)
+
+# All-teams chart keep set (from `Pos` cell — split-WR slots are LWR/RWR/SWR).
+_CHART_FANTASY_POSITIONS: frozenset[str] = frozenset(
+    {"QB", "RB", "LWR", "RWR", "SWR", "TE", "K", "PK"}
+)
+
+
+def _normalize_roster_position(pos: str) -> str | None:
+    """Return the fantasy-mapped position for a roster row, or None if the
+    row should be dropped. Folds 'PK' → 'K' so identity matching against
+    Sleeper-shaped rows succeeds.
+    """
+    if pos not in _ROSTER_FANTASY_POSITIONS:
+        return None
+    return "K" if pos == "PK" else pos
+
+
+def _fantasy_position_from_chart_slot(dc_pos: str) -> str | None:
+    """Return the fantasy `position` (NOT depth_chart_position) implied by
+    an Ourlads chart slot. Used for identity matching when a chart-only row
+    has no matching roster entry. Returns None for non-fantasy slots.
+    """
+    if dc_pos not in _CHART_FANTASY_POSITIONS:
+        return None
+    if dc_pos in ("LWR", "RWR", "SWR"):
+        return "WR"
+    return "K" if dc_pos == "PK" else dc_pos
+
+
 # Sanity bands. Outside these counts we mark a page failed and apply no writes.
-MIN_ROSTER_ROWS = 30
-MAX_ROSTER_ROWS = 120
-# Empirical baseline: ~3,100 entries observed against the live chart in
-# 2026 (32 teams × ~30 depth-chart positions × up to 5 slots, with most
-# slots filled). The band is wide enough to absorb roster turnover and
-# format tweaks while still flagging structural breakage (a torn page
-# returning 100 rows).
-MIN_TOTAL_CHART_ROWS = 1500
-MAX_TOTAL_CHART_ROWS = 5000
+# Bands are applied AFTER position filtering, so they reflect fantasy-only
+# row counts (~10-20 fantasy players per team, ~600-1200 chart entries).
+MIN_ROSTER_ROWS = 8
+MAX_ROSTER_ROWS = 40
+# Empirical baseline: ~900 fantasy chart entries observed against the live
+# chart in 2026 (after dropping non-fantasy slots like LT/RG/LDE/etc.).
+# 32 teams × ~6 fantasy slots × up to 5 depth orders.
+MIN_TOTAL_CHART_ROWS = 500
+MAX_TOTAL_CHART_ROWS = 2000
 MAX_FAILED_TEAMS = 5
 
 # 32 NFL team abbreviations (Ourlads uses these in roster URLs). ARZ for
@@ -206,8 +246,10 @@ def _extract_ourlads_id_from_anchor(a) -> str | None:  # bs4 Tag, untyped
 
 def parse_roster(html: str, *, team: str) -> list[RosterRow]:
     """Parse a single team's roster page. Returns one RosterRow per active
-    player; section dividers are skipped. The team identifier is supplied by
-    the caller — Ourlads pages don't reliably embed it in the table.
+    fantasy-relevant player (QB / RB / WR / TE / K). Non-fantasy positions
+    (DL, OL, LB, DB, special teams) and section dividers are skipped. The
+    team identifier is supplied by the caller — Ourlads pages don't reliably
+    embed it in the table.
     """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
@@ -227,13 +269,16 @@ def parse_roster(html: str, *, team: str) -> list[RosterRow]:
                     player_cell.get_text(" ", strip=True))
         if not raw_name or not position_text:
             continue
+        fantasy_pos = _normalize_roster_position(position_text)
+        if fantasy_pos is None:
+            continue  # non-fantasy position, drop
         full_name = _convert_name_lastfirst_to_firstlast(_strip_annotation(raw_name))
         ourlads_id = _extract_ourlads_id_from_anchor(a)
         rows.append(
             RosterRow(
                 team=team,
                 full_name=full_name,
-                position=position_text,
+                position=fantasy_pos,
                 number=number_text or None,
                 ourlads_id=ourlads_id,
             )
@@ -243,8 +288,8 @@ def parse_roster(html: str, *, team: str) -> list[RosterRow]:
 
 def parse_all_chart(html: str) -> list[ChartEntry]:
     """Parse the all-teams depth chart page. Yields ChartEntry per filled
-    player slot; up to 5 entries per (team, position) row. Skips dividers
-    and incomplete rows.
+    fantasy-relevant slot; up to 5 entries per (team, position) row. Skips
+    non-fantasy slots (LT/RG/LDE/MLB/etc.), dividers, and empty cells.
     """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
@@ -263,6 +308,11 @@ def parse_all_chart(html: str) -> list[ChartEntry]:
             continue
         if not pos_text or pos_text == "Pos":
             continue
+        if pos_text not in _CHART_FANTASY_POSITIONS:
+            continue  # non-fantasy slot, drop the whole row
+        # Normalize PK -> K so the depth_chart_position written to the DB
+        # matches the chart positions used elsewhere in the system.
+        normalized_dc_pos = "K" if pos_text == "PK" else pos_text
         # Slots: cells [2,3], [4,5], [6,7], [8,9], [10,11] — (No, Player).
         for slot_idx in range(5):
             num_cell = cells[2 + slot_idx * 2]
@@ -281,7 +331,7 @@ def parse_all_chart(html: str) -> list[ChartEntry]:
                 ChartEntry(
                     team=team_text,
                     full_name=full_name,
-                    depth_chart_position=pos_text,
+                    depth_chart_position=normalized_dc_pos,
                     depth_chart_order=slot_idx + 1,
                     number=number,
                     ourlads_id=_extract_ourlads_id_from_anchor(a),
@@ -379,12 +429,22 @@ def fetch_all(
     # resolve via name+team+position match).
     for team, rosters in team_roster_rows.items():
         chart_for_team = chart_by_team.get(team, [])
-        # Index chart by simple name+position for fast lookup.
+        # Index chart by (name, fantasy_position) so a roster WR can match
+        # the LWR/RWR/SWR chart slot via the same key. PK -> K already
+        # normalized inside parse_all_chart, but we re-derive here from
+        # depth_chart_position for explicitness.
         chart_index: dict[tuple[str, str], ChartEntry] = {}
         for ce in chart_for_team:
-            chart_index[(ce.full_name, ce.depth_chart_position)] = ce
-        # Roster row → output, optionally enriched with depth from chart.
-        seen_keys: set[tuple[str, str]] = set()
+            fantasy_pos = _fantasy_position_from_chart_slot(ce.depth_chart_position)
+            if fantasy_pos is None:
+                continue
+            # First entry wins on collision (e.g. unlikely duplicate names);
+            # the chart's own ordering puts higher-priority slots first.
+            chart_index.setdefault((ce.full_name, fantasy_pos), ce)
+        # Track which chart entries have been consumed by roster enrichment
+        # so we don't re-emit them as chart-only rows. Key by the chart's
+        # depth_chart_position so split-WR slots stay distinguishable.
+        consumed_chart_keys: set[tuple[str, str]] = set()
         for rr in rosters:
             key = (rr.full_name, rr.position)
             ce = chart_index.get(key)
@@ -398,23 +458,25 @@ def fetch_all(
             if ce is not None:
                 row["depth_chart_position"] = ce.depth_chart_position
                 row["depth_chart_order"] = ce.depth_chart_order
-                seen_keys.add(key)
+                consumed_chart_keys.add((ce.full_name, ce.depth_chart_position))
             result.rows.append(row)
-        # Chart-only entries (positions on chart not in roster, e.g. an
-        # opening-week starter listed at a position other than their
-        # listed roster position): emit as separate rows so the upsert
-        # can try identity match.
+        # Chart-only entries (player listed on chart but not on the
+        # team's roster fetch, e.g. just-promoted from practice squad
+        # before Ourlads updated the roster page). Emit as separate rows
+        # so the upsert can try identity match. The row's `position`
+        # field is the fantasy-mapped equivalent of the chart slot
+        # (LWR/RWR/SWR -> WR, PK -> K) so it can match Sleeper rows.
         for ce in chart_for_team:
-            if (ce.full_name, ce.depth_chart_position) in seen_keys:
+            if (ce.full_name, ce.depth_chart_position) in consumed_chart_keys:
                 continue
-            # Chart's "position" semantically IS depth_chart_position;
-            # we set position to that for matching purposes when no
-            # roster row exists.
+            fantasy_pos = _fantasy_position_from_chart_slot(ce.depth_chart_position)
+            if fantasy_pos is None:
+                continue  # paranoia: parse_all_chart already filtered.
             result.rows.append(
                 {
                     "team": ce.team,
                     "full_name": ce.full_name,
-                    "position": ce.depth_chart_position,
+                    "position": fantasy_pos,
                     "number": ce.number,
                     "ourlads_id": ce.ourlads_id,
                     "depth_chart_position": ce.depth_chart_position,

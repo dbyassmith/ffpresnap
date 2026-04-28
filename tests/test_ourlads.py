@@ -70,17 +70,41 @@ def test_strip_no_annotation_pass_through():
 
 
 def test_parse_roster_atl_smoke():
+    """Filtered to fantasy positions only: QB / RB / WR / TE / K. ATL had ~29."""
     html = _load("roster_ATL.html")
     rows = parse_roster(html, team="ATL")
-    assert 30 <= len(rows) <= 120
-    # Spot-check one known player.
+    assert 8 <= len(rows) <= 40
+    # Every row must be a fantasy position.
+    for r in rows:
+        assert r.position in {"QB", "RB", "WR", "TE", "K"}
+    # Non-fantasy positions are filtered out: Troy Andersen (ILB) is dropped.
     troy = [r for r in rows if r.full_name == "Troy Andersen"]
-    assert len(troy) == 1
-    r = troy[0]
-    assert r.team == "ATL"
-    assert r.position == "ILB"
-    assert r.number == "44"
-    assert r.ourlads_id == "46885"
+    assert troy == []
+    # Spot-check a fantasy player.
+    qbs = [r for r in rows if r.position == "QB"]
+    assert len(qbs) >= 1
+    assert all(q.team == "ATL" for q in qbs)
+
+
+def test_parse_roster_normalizes_pk_to_k():
+    """Ourlads writes 'PK' for kickers; parser maps to fantasy 'K' so identity
+    match against Sleeper-shaped rows works."""
+    html = _load("roster_ATL.html")
+    rows = parse_roster(html, team="ATL")
+    kickers = [r for r in rows if r.position == "K"]
+    assert len(kickers) >= 1
+    # No row should still carry the raw 'PK' value.
+    assert not any(r.position == "PK" for r in rows)
+
+
+def test_parse_roster_drops_non_fantasy_positions():
+    """DT, OG, OT, CB, S, ILB, OLB, DE, LS, PT etc. all get filtered."""
+    html = _load("roster_ATL.html")
+    rows = parse_roster(html, team="ATL")
+    forbidden = {"DT", "OG", "OT", "CB", "S", "ILB", "OLB", "DE", "LS",
+                 "PT", "FS", "SS", "C", "MLB"}
+    for r in rows:
+        assert r.position not in forbidden
 
 
 def test_parse_roster_extracts_ourlads_id_from_profile_link():
@@ -101,10 +125,13 @@ def test_parse_roster_skips_section_dividers():
 
 
 def test_parse_roster_handles_suffix_in_name():
+    """Suffixes in 'Last Suffix, First' format must come out at the end:
+    'Penix Jr., Michael' -> 'Michael Penix Jr.'"""
     html = _load("roster_ATL.html")
     rows = parse_roster(html, team="ATL")
-    # "Allen Jr., Carlos" -> "Carlos Allen Jr."
-    assert any(r.full_name == "Carlos Allen Jr." for r in rows)
+    assert any(r.full_name == "Michael Penix Jr." for r in rows)
+    assert any(r.full_name == "Kyle Pitts Sr." for r in rows)
+    assert any(r.full_name == "Vinny Anthony II" for r in rows)
 
 
 def test_parse_roster_returns_empty_on_no_table():
@@ -115,13 +142,37 @@ def test_parse_roster_returns_empty_on_no_table():
 
 
 def test_parse_all_chart_smoke():
+    """Filtered to fantasy slots only: QB / RB / LWR / RWR / SWR / TE / K.
+    Empirical 2026 fantasy chart has ~900 entries."""
     html = _load("all_chart.html")
     entries = parse_all_chart(html)
-    # Sanity band: empirical 2026 chart has ~3,100 entries.
-    assert 1500 <= len(entries) <= 5000
+    assert 500 <= len(entries) <= 2000
     teams = {e.team for e in entries}
-    # At least 30 of the 32 teams should appear.
     assert len(teams) >= 30
+    # Every entry's depth_chart_position must be a fantasy slot.
+    fantasy_slots = {"QB", "RB", "LWR", "RWR", "SWR", "TE", "K"}
+    for e in entries:
+        assert e.depth_chart_position in fantasy_slots
+
+
+def test_parse_all_chart_drops_non_fantasy_slots():
+    """LT, RG, LDE, SLB, etc. should not appear."""
+    html = _load("all_chart.html")
+    entries = parse_all_chart(html)
+    forbidden = {"LT", "LG", "C", "RG", "RT", "LDE", "RDE", "NT", "DT",
+                 "MLB", "SLB", "WLB", "LCB", "RCB", "FS", "SS", "NB",
+                 "P", "KO", "KR", "PR", "LS", "H", "ROLB", "LOLB"}
+    for e in entries:
+        assert e.depth_chart_position not in forbidden
+
+
+def test_parse_all_chart_normalizes_pk_to_k():
+    """Chart rows where Pos='PK' map to depth_chart_position='K'."""
+    html = _load("all_chart.html")
+    entries = parse_all_chart(html)
+    kickers = [e for e in entries if e.depth_chart_position == "K"]
+    assert len(kickers) >= 30  # one per team, mostly
+    assert not any(e.depth_chart_position == "PK" for e in entries)
 
 
 def test_parse_all_chart_extracts_depth_position_and_order():
@@ -257,7 +308,7 @@ def test_url_construction():
 
 
 def test_fetch_all_sanity_band_short_roster_marks_team_failed():
-    """A roster page that parses to 0 rows trips MIN_ROSTER_ROWS."""
+    """A roster page that parses to 0 fantasy rows trips MIN_ROSTER_ROWS."""
     short_html = b"<html><body><table><tr><td>only</td><td>one</td><td>row</td></tr></table></body></html>"
 
     def fetcher(url: str) -> bytes:
@@ -270,3 +321,20 @@ def test_fetch_all_sanity_band_short_roster_marks_team_failed():
     result = fetch_all(fetcher=fetcher, delay_seconds=0)
     assert any(e.team == "SF" and "sanity" in e.reason for e in result.errors)
     assert "SF" not in result.completeness
+
+
+def test_fetch_all_chart_enriches_roster_with_split_wr_slot():
+    """A roster WR (position='WR') should pick up depth_chart_position='LWR'
+    (or RWR/SWR) from the chart via fantasy-position-keyed merge."""
+    fetcher = _FakeFetcher()
+    result = fetch_all(fetcher=fetcher, delay_seconds=0)
+    # Find rows where the roster WR got enriched with a depth chart slot.
+    enriched = [
+        r for r in result.rows
+        if r["position"] == "WR"
+        and r.get("depth_chart_position") in {"LWR", "RWR", "SWR"}
+    ]
+    assert len(enriched) >= 1, (
+        "no WR rows were enriched with split-WR depth_chart_position — "
+        "fantasy-position chart-index keying is broken"
+    )
