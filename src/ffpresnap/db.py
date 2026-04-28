@@ -498,67 +498,11 @@ class Database:
     # --- players ---
 
     def replace_players(self, rows: list[dict[str, Any]]) -> int:
-        """Atomically replace the players set. Notes for missing players cascade-delete.
-
-        Returns the number of rows written.
+        """Backward-compatible wrapper around upsert_players_for_source('sleeper').
+        Existing callers (tests, pre-Ourlads code paths) keep working unchanged.
+        New code should call upsert_players_for_source directly.
         """
-        now = _now()
-        prepared: list[tuple[Any, ...]] = []
-        seen_ids: set[str] = set()
-        for row in rows:
-            pid = row.get("player_id")
-            if not pid:
-                raise ValueError("player_id is required on every row")
-            pid = str(pid)
-            if pid in seen_ids:
-                raise ValueError(f"Duplicate player_id in input: {pid}")
-            seen_ids.add(pid)
-            values = []
-            for field in PLAYER_FIELDS:
-                if field == "player_id":
-                    values.append(pid)
-                elif field == "updated_at":
-                    values.append(now)
-                else:
-                    values.append(row.get(field))
-            prepared.append(tuple(values))
-
-        placeholders = ", ".join("?" for _ in PLAYER_FIELDS)
-        columns = ", ".join(PLAYER_FIELDS)
-        update_cols = [f for f in PLAYER_FIELDS if f != "player_id"]
-        update_clause = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
-        upsert_sql = (
-            f"INSERT INTO players ({columns}) VALUES ({placeholders}) "
-            f"ON CONFLICT(player_id) DO UPDATE SET {update_clause}"
-        )
-        try:
-            self.conn.execute("BEGIN")
-            # Drop only players absent from the new set; explicitly delete their
-            # notes (notes table no longer has an FK cascade since it is polymorphic).
-            if seen_ids:
-                marks = ",".join("?" for _ in seen_ids)
-                params = tuple(seen_ids)
-                self.conn.execute(
-                    f"DELETE FROM notes WHERE subject_type = 'player' "
-                    f"AND subject_id NOT IN ({marks})",
-                    params,
-                )
-                self.conn.execute(
-                    f"DELETE FROM players WHERE player_id NOT IN ({marks})",
-                    params,
-                )
-            else:
-                self.conn.execute(
-                    "DELETE FROM notes WHERE subject_type = 'player'"
-                )
-                self.conn.execute("DELETE FROM players")
-            if prepared:
-                self.conn.executemany(upsert_sql, prepared)
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        return len(prepared)
+        return self.upsert_players_for_source("sleeper", rows)
 
     def find_player_for_match(
         self, normalized_name: str, team: str, position: str
@@ -662,6 +606,95 @@ class Database:
                 tuple(seen_ids),
             ).fetchall():
                 existing_sources[r["player_id"]] = r["source"]
+
+        # Sleeper-side identity merge: for each input row whose player_id is
+        # NOT already in the table but whose normalized name+team+position
+        # matches an existing Ourlads-only row, transfer notes/mentions to the
+        # incoming Sleeper player_id and delete the Ourlads-only row. After
+        # this loop, the Sleeper UPSERT below inserts the new row in place
+        # with source='merged' and the captured ourlads metadata.
+        merged_metadata: dict[str, dict[str, Any]] = {}
+        for row in validated:
+            pid = row["player_id"]
+            if pid in existing_sources:
+                continue  # already in table, normal UPSERT path handles it.
+            team = row.get("team")
+            full_name = row.get("full_name")
+            position = row.get("position")
+            if not (team and full_name and position):
+                continue
+            normalized = normalize_full_name(full_name)
+            candidates = [
+                r
+                for r in self.conn.execute(
+                    "SELECT * FROM players WHERE team = ? AND position = ? "
+                    "AND source = 'ourlads'",
+                    (team, position),
+                ).fetchall()
+                if normalize_full_name(r["full_name"] or "") == normalized
+            ]
+            if len(candidates) != 1:
+                if len(candidates) > 1:
+                    sys.stderr.write(
+                        "sleeper:identity:ambiguous: "
+                        f"name={normalized} team={team} position={position} "
+                        f"candidates={[c['player_id'] for c in candidates]} "
+                        "(skipping merge, inserting as new sleeper row)\n"
+                    )
+                continue
+            ourlads_row = candidates[0]
+            old_pid = ourlads_row["player_id"]
+            # Capture Ourlads-owned metadata to merge into the new row.
+            merged_metadata[pid] = {
+                "ourlads_id": ourlads_row["ourlads_id"],
+                "depth_chart_position": ourlads_row["depth_chart_position"],
+                "depth_chart_order": ourlads_row["depth_chart_order"],
+                "depth_chart_last_observed_at": ourlads_row[
+                    "depth_chart_last_observed_at"
+                ],
+            }
+            # Insert a placeholder row at the new pid so the FK target exists
+            # before we update note_player_mentions to point at it. Use a
+            # minimal row that will be overwritten by the UPSERT below.
+            self.conn.execute(
+                "INSERT INTO players (player_id, full_name, team, position, "
+                "updated_at, watchlist, source, ourlads_id, "
+                "depth_chart_position, depth_chart_order, "
+                "depth_chart_last_observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'merged', ?, ?, ?, ?) "
+                "ON CONFLICT(player_id) DO NOTHING",
+                (
+                    pid,
+                    full_name,
+                    team,
+                    position,
+                    now,
+                    ourlads_row["watchlist"],
+                    ourlads_row["ourlads_id"],
+                    ourlads_row["depth_chart_position"],
+                    ourlads_row["depth_chart_order"],
+                    ourlads_row["depth_chart_last_observed_at"],
+                ),
+            )
+            # Move notes (polymorphic, no FK) and mentions (FK with cascade)
+            # to point at the new player_id.
+            self.conn.execute(
+                "UPDATE notes SET subject_id = ? "
+                "WHERE subject_type = 'player' AND subject_id = ?",
+                (pid, old_pid),
+            )
+            self.conn.execute(
+                "UPDATE note_player_mentions SET player_id = ? WHERE player_id = ?",
+                (pid, old_pid),
+            )
+            # Now safe to delete the Ourlads-only row.
+            self.conn.execute(
+                "DELETE FROM players WHERE player_id = ?", (old_pid,)
+            )
+            # Tell the upsert below this row should be treated as a 'merged'
+            # update (so it goes through the opt-out path that preserves
+            # depth_chart values).
+            existing_sources[pid] = "merged"
 
         # Per-row UPSERT (we need branching on existing source, so executemany
         # isn't ideal). DB has ~3k rows; per-row INSERT cost is microseconds.

@@ -433,6 +433,124 @@ def test_last_sync_filters_by_source(tmp_path):
         db.close()
 
 
+# --- Bidirectional merge: Sleeper picks up Ourlads-first player ---
+
+
+def test_sleeper_picks_up_ourlads_only_player_merges_in_place(tmp_path):
+    """When Sleeper sync inserts a new player_id whose name+team+position
+    matches an existing Ourlads-only row, the Ourlads-only row's metadata
+    (ourlads_id, depth chart) and any notes/mentions transfer to the new
+    Sleeper player_id, and the Ourlads-only row is deleted. No duplicate
+    rows; notes survive."""
+    db = _open(tmp_path)
+    try:
+        # Practice-squad guy on Ourlads first.
+        db.upsert_players_for_source(
+            "ourlads",
+            [_ourlads_row(
+                full_name="Practice Squad Promotion",
+                team="ATL",
+                position="WR",
+                ourlads_id="9999",
+                depth_chart_position="WR",
+                depth_chart_order=4,
+            )],
+        )
+        ourlads_pid = "ourlads:9999"
+        ourlads_row = db.get_player(ourlads_pid)
+        assert ourlads_row["source"] == "ourlads"
+
+        # User attaches a note to the Ourlads-only row.
+        db.add_note(ourlads_pid, "watch this guy — could pop late round")
+        notes_before = db.list_notes(ourlads_pid)
+        assert len(notes_before) == 1
+
+        # Sleeper picks them up — new Sleeper player_id 'S100', same name+team+pos.
+        db.upsert_players_for_source(
+            "sleeper",
+            [_sleeper_row(
+                "S100",
+                full_name="Practice Squad Promotion",
+                team="ATL",
+                position="WR",
+                # Sleeper would write null/different depth — should NOT clobber.
+                depth_chart_position=None,
+                depth_chart_order=None,
+            )],
+        )
+
+        # Old ourlads-only row is gone.
+        with pytest.raises(Exception):
+            db.get_player(ourlads_pid)
+
+        # New row at S100, source='merged', ourlads_id transferred,
+        # depth chart from Ourlads preserved (per-field ownership).
+        merged = db.get_player("S100")
+        assert merged["source"] == "merged"
+        assert merged["ourlads_id"] == "9999"
+        assert merged["depth_chart_position"] == "WR"
+        assert merged["depth_chart_order"] == 4
+
+        # Notes migrated.
+        notes_after = db.list_notes("S100")
+        assert len(notes_after) == 1
+        assert "watch this guy" in notes_after[0]["body"]
+
+        # Only one row total.
+        all_players = db.list_players()
+        assert len(all_players) == 1
+    finally:
+        db.close()
+
+
+def test_sleeper_picks_up_with_team_mention_preserves_mention_fk(tmp_path):
+    """A note on a different player that mentions the Ourlads-only player
+    should still mention the merged Sleeper player_id after pickup."""
+    db = _open(tmp_path)
+    try:
+        # Existing Sleeper player who'll have a note that mentions the Ourlads guy.
+        db.upsert_players_for_source(
+            "sleeper",
+            [_sleeper_row("MENTIONER", full_name="Some Other Guy", team="KC",
+                          position="QB")],
+        )
+        # Ourlads-only player.
+        db.upsert_players_for_source(
+            "ourlads",
+            [_ourlads_row(full_name="Promotion Target", team="ATL", position="WR",
+                          ourlads_id="42")],
+        )
+        # Add a note on MENTIONER that mentions the Ourlads-only player.
+        db.add_note(
+            "MENTIONER",
+            "I'm bullish on Promotion Target",
+            mentions={"player_ids": ["ourlads:42"], "team_abbrs": []},
+        )
+
+        # Sleeper picks up the promoted player. A realistic Sleeper sync
+        # includes every Sleeper player in the input — including MENTIONER —
+        # so the source-scoped DELETE doesn't wipe MENTIONER and its mentions.
+        db.upsert_players_for_source(
+            "sleeper",
+            [
+                _sleeper_row("MENTIONER", full_name="Some Other Guy", team="KC",
+                             position="QB"),
+                _sleeper_row("PROMOTED", full_name="Promotion Target", team="ATL",
+                             position="WR"),
+            ],
+        )
+
+        merged = db.get_player("PROMOTED")
+        assert merged["source"] == "merged"
+
+        # The mention now points at PROMOTED, not 'ourlads:42'.
+        mentions_for_promoted = db.list_player_mentions("PROMOTED")
+        assert len(mentions_for_promoted) == 1
+        assert "Promotion Target" in mentions_for_promoted[0]["body"]
+    finally:
+        db.close()
+
+
 # --- find_player_for_match ---
 
 

@@ -4,7 +4,7 @@ import json
 from typing import Any, Callable
 
 from . import sleeper as _sleeper
-from .db import PLAYER_FIELDS, Database
+from .db import PLAYER_FIELDS, Database, _now
 from .sleeper import PLAYERS_URL
 
 
@@ -42,15 +42,41 @@ def _project(player_id: str, player: dict[str, Any]) -> dict[str, Any]:
 def run_sync(
     db: Database,
     *,
+    source: str = "sleeper",
     fetch: FetchFn | None = None,
-    source_url: str = PLAYERS_URL,
+    source_url: str | None = None,
+) -> dict[str, Any]:
+    """Pull player data from the named source, project rows, and write them
+    via Database.upsert_players_for_source. Always records a sync_runs row,
+    even on failure. Raises ConcurrentSyncError if another run is in flight.
+
+    Currently supports source='sleeper'. Source='ourlads' will land in a
+    future unit; this function dispatches based on the source value.
+    """
+    if source == "sleeper":
+        return _run_sleeper_sync(db, fetch=fetch, source_url=source_url)
+    if source == "ourlads":
+        # Stubbed until Unit 4 lands the Ourlads pipeline. The tool surface
+        # exists; the runtime path raises a clear NotImplementedError so users
+        # invoking it pre-Unit-4 see exactly what's missing.
+        raise NotImplementedError(
+            "Ourlads sync pipeline lands in a follow-up unit; not yet wired."
+        )
+    raise ValueError(f"Unknown sync source: {source!r}")
+
+
+def _run_sleeper_sync(
+    db: Database,
+    *,
+    fetch: FetchFn | None,
+    source_url: str | None,
 ) -> dict[str, Any]:
     if fetch is None:
         fetch = _sleeper.fetch_players
-    """Pull Sleeper player data, filter to fantasy positions, and atomically replace
-    the players table. Always records a sync_runs row, even on failure.
-    """
-    run_id = db.record_sync_start(source_url)
+    if source_url is None:
+        source_url = PLAYERS_URL
+    run_start_at = _now()
+    run_id = db.record_sync_start(source_url, source="sleeper")
     try:
         payload = fetch(source_url)
         rows = [
@@ -58,12 +84,15 @@ def run_sync(
             for pid, p in payload.items()
             if isinstance(p, dict) and _is_fantasy_relevant(p)
         ]
-        written = db.replace_players(rows)
+        written = db.upsert_players_for_source(
+            "sleeper", rows, run_start_at=run_start_at
+        )
         finished = db.record_sync_finish(run_id, written, "success")
         return {
             "run_id": run_id,
             "players_written": written,
             "status": "success",
+            "source": "sleeper",
             "started_at": finished["started_at"],
             "finished_at": finished["finished_at"],
         }
