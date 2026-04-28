@@ -28,11 +28,11 @@ The 32 NFL teams. Seeded on first open and not mutated by sync.
 
 ### `players`
 
-Fantasy-relevant players (QB, RB, WR, TE, K, DEF) mirrored from the [Sleeper API](https://docs.sleeper.com/). Refreshed by `ffpresnap-sync` or the `sync_players` MCP tool. Sleeper-sourced fields are overwritten on every sync; **`watchlist` is preserved across syncs.**
+Fantasy-relevant players (QB, RB, WR, TE, K, DEF) mirrored from one or more sources. **Multi-source as of schema v7:** rows can originate from Sleeper, Ourlads, or both. Refreshed by `ffpresnap-sync --source=<name>` or the `sync_players(source=...)` MCP tool. Sleeper-sourced fields are overwritten on every Sleeper sync; **`watchlist`, `source`, `ourlads_id`, and `depth_chart_last_observed_at` are preserved across Sleeper syncs.** The `source` column distinguishes ownership.
 
 | Column | Type | Notes |
 |---|---|---|
-| `player_id` | TEXT | Primary key. Sleeper's `player_id`. |
+| `player_id` | TEXT | Primary key. Stable across the row's lifetime. Sleeper's `player_id` for Sleeper-originated rows; `ourlads:<id>` or `<TEAM>:<jersey>:<name>` for Ourlads-only rows. |
 | `full_name` | TEXT | |
 | `first_name` | TEXT | |
 | `last_name` | TEXT | |
@@ -59,8 +59,17 @@ Fantasy-relevant players (QB, RB, WR, TE, K, DEF) mirrored from the [Sleeper API
 | `sportradar_id` | TEXT | Cross-platform id. |
 | `updated_at` | TEXT | ISO timestamp set on each sync. |
 | `watchlist` | INTEGER | 0/1 boolean. **User-owned, preserved across syncs.** |
+| `source` | TEXT | NOT NULL. `'sleeper'` (Sleeper-only), `'ourlads'` (Ourlads-only — Sleeper hasn't picked them up), or `'merged'` (matched in both). Drives source-scoped DELETE on Sleeper sync and per-field ownership of `depth_chart_position` / `_order` (Ourlads owns these on rows it touched). |
+| `ourlads_id` | TEXT | Ourlads' internal player profile id, captured from the page. Set on identity merge so subsequent Ourlads runs find the row even if the player is traded. Null for Sleeper-only rows. |
+| `depth_chart_last_observed_at` | TEXT | ISO timestamp of the last Ourlads run that observed this player on the depth chart. Drives R13: when Ourlads' team chart was successfully synced and a player isn't on it, their depth fields clear and `'merged'` rows demote to `'sleeper'`. |
 
 Indexes: `team`, `position`, `full_name COLLATE NOCASE`.
+
+#### Source semantics
+
+- **Sleeper sync** (`source='sleeper'`): wholesale replace of Sleeper-sourced rows. Rows where `source IN ('ourlads','merged')` survive. Sleeper does **not** overwrite `depth_chart_position` / `_order` on `'merged'` rows — Ourlads owns those (per-field ownership).
+- **Ourlads sync** (`source='ourlads'`): identity-matches incoming rows to existing Sleeper rows by name+team+position (or by previously-bound `ourlads_id`). On match, the existing row updates in place and bumps `source` to `'merged'`. Practice-squad-promotion is bidirectional: a Sleeper sync that picks up a player Ourlads already had transfers notes/mentions and deletes the Ourlads-only row in one transaction.
+- **Notes survive** identity merges because `player_id` is immutable post-insert.
 
 ### `studies`
 
@@ -124,7 +133,7 @@ Index: `team_abbr`.
 
 ### `sync_runs`
 
-Audit log of every `ffpresnap-sync` invocation.
+Audit log of every `ffpresnap-sync` invocation. Also acts as an advisory concurrency lock — a row with `status='running'` and `started_at` within the last 5 minutes blocks new sync starts (`ConcurrentSyncError`).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -132,11 +141,12 @@ Audit log of every `ffpresnap-sync` invocation.
 | `started_at` | TEXT | ISO timestamp. |
 | `finished_at` | TEXT | Null while in flight. |
 | `players_written` | INTEGER | Final count on success. |
-| `source_url` | TEXT | Sleeper endpoint that was fetched. |
+| `source_url` | TEXT | Endpoint that was fetched (Sleeper API URL or Ourlads chart URL). |
 | `status` | TEXT | `running` \| `success` \| `error`. |
-| `error` | TEXT | Error message on failure. |
+| `error` | TEXT | Error message on failure. For partial Ourlads runs, also carries a comma-separated per-team error list. |
+| `source` | TEXT | NOT NULL. `'sleeper'` or `'ourlads'`. |
 
-Surfaced via the `last_sync` MCP tool.
+Surfaced via the `last_sync(source?)` and `get_sync_status(run_id)` MCP tools.
 
 ### `prompts`
 

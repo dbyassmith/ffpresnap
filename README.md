@@ -2,7 +2,7 @@
 
 Your personal NFL fantasy-football scratchpad — wired into Claude.
 
-ffpresnap is a small local app that mirrors NFL roster and depth-chart data from the [Sleeper API](https://docs.sleeper.com/) into a SQLite file on your machine and exposes it to Claude (Desktop, Code, or Cowork) as an MCP server. Once it's running, you can ask Claude things like:
+ffpresnap is a small local app that mirrors NFL roster and depth-chart data from the [Sleeper API](https://docs.sleeper.com/) into a SQLite file on your machine, with an optional second sync from [ourlads.com](https://www.ourlads.com/nfldepthcharts/) for hand-curated depth charts that often beat Sleeper to lineup changes. It exposes everything to Claude (Desktop, Code, or Cowork) as an MCP server. Once it's running, you can ask Claude things like:
 
 > *"Show me the Chiefs depth chart."*
 > *"Add a note to Patrick Mahomes: ankle is wrapped on the practice report — watch it."*
@@ -56,18 +56,23 @@ This installs two console scripts inside the venv:
 ### 3. Pull the initial player data
 
 ```bash
-ffpresnap-sync
+ffpresnap-sync                      # default source: sleeper
+ffpresnap-sync --source=ourlads     # optional: layer Ourlads depth charts on top
 ```
 
-You should see something like `synced 4231 players in 0.4s (run_id=1)`. This filters to fantasy-relevant positions (QB, RB, WR, TE, K, DEF) and writes them to `~/.ffpresnap/notes.db`.
+You should see something like `synced 4231 players in 0.4s (run_id=1, source=sleeper)`. The Sleeper sync filters to fantasy-relevant positions (QB, RB, WR, TE, K, DEF) and writes them to `~/.ffpresnap/notes.db`.
 
-You can rerun this whenever you want fresh roster/injury data. Sleeper recommends no more than once per day; a daily cron is a reasonable default:
+The optional **Ourlads** sync layers hand-curated, beat-reporter-driven depth charts on top of Sleeper's data. It fetches 32 team rosters plus one all-teams depth-chart page from [ourlads.com](https://www.ourlads.com/nfldepthcharts/) (~1-3 minutes total at the polite 1.5s/request default) and merges them into the same `players` table — without disturbing your Sleeper-sourced notes. Players Ourlads tracks but Sleeper hasn't picked up yet (practice-squad call-ups, recent signings) become first-class entries you can attach notes to.
+
+You can rerun either source whenever you want fresh data. A reasonable daily cron does both, in order:
 
 ```cron
-0 9 * * * /absolute/path/to/.venv/bin/ffpresnap-sync
+0 9 * * * /absolute/path/to/.venv/bin/ffpresnap-sync --source=sleeper && /absolute/path/to/.venv/bin/ffpresnap-sync --source=ourlads
 ```
 
-You can also ask Claude to run `sync_players` from inside a chat once the MCP is connected.
+(Per-field ownership means Ourlads owns `depth_chart_position` / `_order` once it has touched a row, so cron ordering doesn't actually matter — but Sleeper-then-Ourlads is the more intuitive sequence.)
+
+You can also ask Claude to run `sync_players` from inside a chat once the MCP is connected. Sleeper sync returns a summary inline (~5s); Ourlads sync runs in a background thread and returns a `run_id` immediately — Claude polls `get_sync_status(run_id)` to track completion.
 
 ### 4. Connect to Claude
 
@@ -115,7 +120,7 @@ In Claude, ask:
 
 > *"What ffpresnap tools do you have?"*
 
-You should see 19 tools listed (`sync_players`, `list_teams`, `get_depth_chart`, `add_note`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
+You should see 20 tools listed (`sync_players`, `get_sync_status`, `list_teams`, `get_depth_chart`, `add_note`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
 
 ---
 

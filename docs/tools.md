@@ -1,11 +1,12 @@
 # MCP tools reference
 
-ffpresnap exposes 19 tools to Claude. You don't need to call these directly — Claude picks the right one when you describe what you want — but it's useful to know what's available.
+ffpresnap exposes 20 tools to Claude. You don't need to call these directly — Claude picks the right one when you describe what you want — but it's useful to know what's available.
 
 ## Sync
 
-- `sync_players()` — pull current Sleeper data into the local DB.
-- `last_sync()` — show the most recent sync run.
+- `sync_players(source?)` — pull current player data from a source. `source` is `"sleeper"` (default, ~5s, returns full summary synchronously) or `"ourlads"` (~1-3 min, runs in a background thread and returns a `run_id` immediately). Sleeper sync overwrites every Sleeper-sourced row; Ourlads sync merges into existing rows by name+team+position and binds `ourlads_id` for stability across runs.
+- `last_sync(source?)` — show the most recent sync run. Optional `source` restricts to runs of that source (`"sleeper"` or `"ourlads"`).
+- `get_sync_status(run_id)` — read a `sync_runs` row by id. Use after starting an Ourlads sync to poll for completion; the row's `status` becomes `"success"` or `"error"` when the background run finishes. Per-team failures (parse, sanity, network) land in the `error` column.
 
 ## Browse
 
