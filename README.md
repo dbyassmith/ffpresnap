@@ -128,9 +128,18 @@ Build me a Claude artifact that displays the ffpresnap prompt library.
 
 Step 1. Call the MCP tool `list_prompts` (no arguments).
 
-Step 2. Embed the JSON result directly into the artifact source as a JavaScript constant — the artifact is a snapshot, not a live fetch. To refresh it later, ask Claude to regenerate the artifact.
+Step 2. Embed the JSON result directly into the artifact source as a JavaScript constant — the artifact is a snapshot, not a live fetch.
 
 Step 3. Render the prompts as a responsive card grid. Each card shows the prompt's `title` as the heading, the `description` as a one-line subhead, and a "Copy prompt" button that calls `navigator.clipboard.writeText(prompt.body)` and briefly shows "Copied!" in place of the button label.
+
+Step 4. Above the grid, render an intro block in this order:
+- A small wordmark / title: "ffpresnap".
+- A short paragraph (max ~640px wide): *"ffpresnap is an un-opinionated scratchpad for all of your fantasy football research. Using the MCP, you can ask Claude to build whatever dashboards best suit your needs — the prompts below are just a starting point."*
+- A one-line instruction beneath it in muted text: "Click 'Copy prompt' on any card, paste it into a new chat with the ffpresnap MCP connected, and Claude will build the dashboard."
+
+Step 5. In the top-right of the header, render a refresh icon button (↻). Because the artifact is a snapshot and cannot call MCP tools directly, the refresh button works by copy-to-clipboard: on click, call `navigator.clipboard.writeText("Show me the prompt library")` and briefly flash "Copied! Paste in Claude to pull fresh prompts." next to the button. Aria-label: "Refresh prompts (copies regenerate command)". Below the header in small muted text: *"This is a snapshot. Click ↻ to copy the regenerate command — paste it in Claude to pull the latest prompts."*
+
+Step 6. Visual style: clean cards with subtle borders, generous padding, readable typography. Plain React + inline styles. Mobile-friendly grid (1 column on narrow screens, 2–3 on wider). The refresh button stays aligned to the right of the header on all screen sizes.
 ```
 
 Claude will build an artifact with one card per dashboard prompt:
@@ -142,7 +151,9 @@ Claude will build an artifact with one card per dashboard prompt:
 | **Depth Chart Explorer** | Pick a team, see depth chart grouped by position |
 | **Note Recency Feed** | Chronological feed of every note you've written |
 | **Player Explorer** | Search or browse a team's depth chart, drill into a player, compose notes |
+| **Team Explorer** | Drill from all NFL teams into one team's depth chart and notes, then into a single player |
 | **Team Overview** | Combined depth chart + team notes + mentions |
+| **Watchlist** | Browse watchlisted players, drill into details, copy add/remove commands |
 | **Mention Graph** | Node-link graph of who-mentions-whom across notes |
 
 Click **Copy prompt** on any card, open a new Claude chat, paste, and Claude will build that dashboard for you using your local data.
