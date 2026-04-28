@@ -1,7 +1,7 @@
 ---
 title: "feat: Ourlads.com depth-chart & roster sync as a second source"
 type: feat
-status: active
+status: completed
 date: 2026-04-28
 origin: docs/brainstorms/2026-04-28-ourlads-sync-requirements.md
 ---
