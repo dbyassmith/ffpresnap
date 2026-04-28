@@ -10,7 +10,7 @@ from . import prompt_loader
 from .teams import TEAMS
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class NotFoundError(Exception):
@@ -95,7 +95,10 @@ CREATE TABLE IF NOT EXISTS players (
   rotowire_id TEXT,
   sportradar_id TEXT,
   updated_at TEXT NOT NULL,
-  watchlist INTEGER NOT NULL DEFAULT 0
+  watchlist INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'sleeper',
+  ourlads_id TEXT,
+  depth_chart_last_observed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team);
@@ -147,7 +150,8 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   players_written INTEGER,
   source_url TEXT NOT NULL,
   status TEXT NOT NULL,
-  error TEXT
+  error TEXT,
+  source TEXT NOT NULL DEFAULT 'sleeper'
 );
 
 CREATE TABLE IF NOT EXISTS prompts (
@@ -176,6 +180,9 @@ def _team_row(row: sqlite3.Row) -> dict[str, Any]:
 def _player_row(row: sqlite3.Row) -> dict[str, Any]:
     out = {field: row[field] for field in PLAYER_FIELDS}
     out["watchlist"] = bool(row["watchlist"])
+    out["source"] = row["source"]
+    out["ourlads_id"] = row["ourlads_id"]
+    out["depth_chart_last_observed_at"] = row["depth_chart_last_observed_at"]
     return out
 
 
@@ -212,6 +219,7 @@ def _sync_run_row(row: sqlite3.Row) -> dict[str, Any]:
         "source_url": row["source_url"],
         "status": row["status"],
         "error": row["error"],
+        "source": row["source"],
     }
 
 
@@ -307,6 +315,43 @@ class Database:
                 self.conn.execute(
                     "ALTER TABLE players ADD COLUMN watchlist INTEGER NOT NULL DEFAULT 0"
                 )
+
+        # v6 -> v7: add multi-source tracking columns. Three new columns on
+        # players (source, ourlads_id, depth_chart_last_observed_at) and one on
+        # sync_runs (source). All ALTER TABLE ADD COLUMN with safe defaults.
+        # Each ALTER is PRAGMA-guarded so partial-prior-application is idempotent.
+        # After ALTERs, run an UPDATE ... WHERE source IS NULL to defend against
+        # any prior hand-modification that left NULL `source` values.
+        if current >= 6 and current < 7:
+            player_cols = self.conn.execute("PRAGMA table_info(players)").fetchall()
+            player_names = {c["name"] for c in player_cols}
+            if player_cols and "source" not in player_names:
+                self.conn.execute(
+                    "ALTER TABLE players ADD COLUMN source TEXT NOT NULL DEFAULT 'sleeper'"
+                )
+            if player_cols and "ourlads_id" not in player_names:
+                self.conn.execute(
+                    "ALTER TABLE players ADD COLUMN ourlads_id TEXT"
+                )
+            if player_cols and "depth_chart_last_observed_at" not in player_names:
+                self.conn.execute(
+                    "ALTER TABLE players ADD COLUMN depth_chart_last_observed_at TEXT"
+                )
+            sync_cols = self.conn.execute(
+                "PRAGMA table_info(sync_runs)"
+            ).fetchall()
+            sync_names = {c["name"] for c in sync_cols}
+            if sync_cols and "source" not in sync_names:
+                self.conn.execute(
+                    "ALTER TABLE sync_runs ADD COLUMN source TEXT NOT NULL DEFAULT 'sleeper'"
+                )
+            # NULL-source backfill defends against partial-prior-state.
+            self.conn.execute(
+                "UPDATE players SET source = 'sleeper' WHERE source IS NULL"
+            )
+            self.conn.execute(
+                "UPDATE sync_runs SET source = 'sleeper' WHERE source IS NULL"
+            )
 
         # v4 -> v5 is purely additive (the `prompts` table). The
         # executescript(SCHEMA_V2) call below creates it; this arm exists for
