@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import datetime, timezone
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from . import prompt_loader
+from ._naming import normalize_full_name, synthesize_ourlads_id
 from .teams import TEAMS
 
 
@@ -14,6 +16,12 @@ SCHEMA_VERSION = 7
 
 
 class NotFoundError(Exception):
+    pass
+
+
+class ConcurrentSyncError(Exception):
+    """Raised when another sync run is already in flight (advisory lock)."""
+
     pass
 
 
@@ -552,6 +560,328 @@ class Database:
             raise
         return len(prepared)
 
+    def find_player_for_match(
+        self, normalized_name: str, team: str, position: str
+    ) -> list[dict[str, Any]]:
+        """Return all players whose normalized name + team + position match.
+        Used by the Ourlads identity-merge path. Normalization happens in
+        Python (NFKD + diacritic strip) so the comparison is symmetric with
+        the incoming row.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM players WHERE team = ? AND position = ?",
+            (team, position),
+        ).fetchall()
+        return [
+            _player_row(r)
+            for r in rows
+            if normalize_full_name(r["full_name"] or "") == normalized_name
+        ]
+
+    def upsert_players_for_source(
+        self,
+        source: str,
+        rows: list[dict[str, Any]],
+        *,
+        completeness: dict[str, bool] | None = None,
+        run_start_at: str | None = None,
+    ) -> int:
+        """Upsert player rows scoped by source. Returns rows successfully
+        written or merged.
+
+        For ``source='sleeper'`` the rows are expected to carry ``player_id``
+        (Sleeper provides stable ids). For each row:
+          - If no existing row with that player_id, INSERT with source='sleeper'.
+          - If existing row has source='sleeper', full UPSERT (overwrites all
+            sync-managed fields).
+          - If existing row has source IN ('ourlads', 'merged'), UPSERT but
+            **skip** depth_chart_position / depth_chart_order writes (per-field
+            ownership: Ourlads owns depth chart on rows it has touched).
+        After upserts, source-scoped DELETE removes any source='sleeper' rows
+        no longer in the input set, plus orphan-note cleanup.
+
+        For ``source='ourlads'`` each row carries ``team``, ``full_name``,
+        ``position``, optional ``ourlads_id``, optional ``number``, optional
+        ``depth_chart_position``/``depth_chart_order``. Identity matching:
+          - If ``ourlads_id`` provided and matches an existing row, update in
+            place (bump source 'sleeper' -> 'merged' if needed).
+          - Else look up by find_player_for_match. Exactly one match: update
+            in place; bind ourlads_id; bump source 'sleeper' -> 'merged'.
+            Zero or >1: insert new row with synthesized player_id and
+            source='ourlads'. Multi-match logs an ambiguous-match line to
+            stderr.
+        Ourlads sync does not delete rows en masse; it only upserts. After
+        upserts, when ``completeness[team]`` is True for a given team, R13
+        runs: for any source IN ('ourlads','merged') row on that team whose
+        ``depth_chart_last_observed_at`` is older than ``run_start_at``,
+        clear depth fields. For source='merged' rows specifically, also
+        demote source -> 'sleeper' and clear ourlads_id (Sleeper resumes
+        ownership).
+        """
+        if source not in ("sleeper", "ourlads"):
+            raise ValueError(f"unknown source: {source!r}")
+
+        run_at = run_start_at or _now()
+        written = 0
+
+        try:
+            self.conn.execute("BEGIN")
+            if source == "sleeper":
+                written = self._upsert_sleeper_rows(rows, now=run_at)
+            else:
+                written = self._upsert_ourlads_rows(
+                    rows, completeness=completeness, run_start_at=run_at
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return written
+
+    def _upsert_sleeper_rows(self, rows: list[dict[str, Any]], *, now: str) -> int:
+        # Validate input + collect ids.
+        seen_ids: set[str] = set()
+        validated: list[dict[str, Any]] = []
+        for row in rows:
+            pid = row.get("player_id")
+            if not pid:
+                raise ValueError("player_id is required on every Sleeper row")
+            pid = str(pid)
+            if pid in seen_ids:
+                raise ValueError(f"Duplicate player_id in input: {pid}")
+            seen_ids.add(pid)
+            validated.append({**row, "player_id": pid})
+
+        # Pull existing source for each input id so we know which rows need
+        # the Ourlads-owned-fields opt-out.
+        existing_sources: dict[str, str] = {}
+        if seen_ids:
+            marks = ",".join("?" for _ in seen_ids)
+            for r in self.conn.execute(
+                f"SELECT player_id, source FROM players WHERE player_id IN ({marks})",
+                tuple(seen_ids),
+            ).fetchall():
+                existing_sources[r["player_id"]] = r["source"]
+
+        # Per-row UPSERT (we need branching on existing source, so executemany
+        # isn't ideal). DB has ~3k rows; per-row INSERT cost is microseconds.
+        full_columns = list(PLAYER_FIELDS)
+        full_placeholders = ", ".join("?" for _ in full_columns)
+        full_update_cols = [f for f in full_columns if f != "player_id"]
+        full_update_clause = ", ".join(
+            f"{c} = excluded.{c}" for c in full_update_cols
+        )
+        full_upsert_sql = (
+            f"INSERT INTO players ({', '.join(full_columns)}) "
+            f"VALUES ({full_placeholders}) "
+            f"ON CONFLICT(player_id) DO UPDATE SET {full_update_clause}"
+        )
+        # Ourlads-owned fields excluded from update set (still inserted on
+        # first write). For an existing row with source='ourlads'/'merged',
+        # the UPDATE branch keeps the row's existing depth_chart values.
+        opt_out_update_cols = [
+            f
+            for f in full_columns
+            if f not in ("player_id", "depth_chart_position", "depth_chart_order")
+        ]
+        opt_out_update_clause = ", ".join(
+            f"{c} = excluded.{c}" for c in opt_out_update_cols
+        )
+        opt_out_upsert_sql = (
+            f"INSERT INTO players ({', '.join(full_columns)}) "
+            f"VALUES ({full_placeholders}) "
+            f"ON CONFLICT(player_id) DO UPDATE SET {opt_out_update_clause}"
+        )
+
+        for row in validated:
+            values = []
+            for field in full_columns:
+                if field == "player_id":
+                    values.append(row["player_id"])
+                elif field == "updated_at":
+                    values.append(now)
+                else:
+                    values.append(row.get(field))
+            existing = existing_sources.get(row["player_id"])
+            if existing in ("ourlads", "merged"):
+                # Per-field ownership: do not overwrite Ourlads-owned depth
+                # chart on existing merged/ourlads rows. The INSERT branch
+                # never fires here (row already exists), so only the UPDATE
+                # set matters.
+                self.conn.execute(opt_out_upsert_sql, tuple(values))
+            else:
+                # Either no existing row (insert with source='sleeper') or
+                # existing source='sleeper' (full overwrite).
+                self.conn.execute(full_upsert_sql, tuple(values))
+
+        # Source-scoped DELETE: remove sleeper-source rows not in input.
+        if seen_ids:
+            marks = ",".join("?" for _ in seen_ids)
+            params = tuple(seen_ids)
+            self.conn.execute(
+                f"DELETE FROM players WHERE source = 'sleeper' "
+                f"AND player_id NOT IN ({marks})",
+                params,
+            )
+        else:
+            self.conn.execute(
+                "DELETE FROM players WHERE source = 'sleeper'"
+            )
+
+        # Orphan-note cleanup: any player-subject note pointing at a player_id
+        # no longer in the table (notes table is polymorphic, no FK cascade).
+        self.conn.execute(
+            "DELETE FROM notes WHERE subject_type = 'player' "
+            "AND subject_id NOT IN (SELECT player_id FROM players)"
+        )
+        return len(validated)
+
+    def _upsert_ourlads_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        completeness: dict[str, bool] | None,
+        run_start_at: str,
+    ) -> int:
+        written = 0
+        for row in rows:
+            team = row.get("team")
+            full_name = row.get("full_name")
+            position = row.get("position")
+            if not (team and full_name and position):
+                # Skip malformed rows defensively; Unit 4 should not produce these.
+                continue
+            ourlads_id = row.get("ourlads_id")
+            jersey = row.get("number")
+            normalized = normalize_full_name(full_name)
+
+            existing_row: dict[str, Any] | None = None
+
+            # Phase 1: ourlads_id lookup (if present and previously bound).
+            if ourlads_id:
+                hit = self.conn.execute(
+                    "SELECT * FROM players WHERE ourlads_id = ?",
+                    (ourlads_id,),
+                ).fetchone()
+                if hit is not None:
+                    existing_row = _player_row(hit)
+
+            # Phase 2: name+team+position lookup if no ourlads_id match.
+            if existing_row is None:
+                candidates = self.find_player_for_match(normalized, team, position)
+                if len(candidates) == 1:
+                    existing_row = candidates[0]
+                elif len(candidates) > 1:
+                    sys.stderr.write(
+                        "ourlads:identity:ambiguous: "
+                        f"name={normalized} team={team} position={position} "
+                        f"candidates={[c['player_id'] for c in candidates]}\n"
+                    )
+                    existing_row = None  # fall through to insert as Ourlads-only
+
+            if existing_row is not None:
+                pid = existing_row["player_id"]
+                new_source = "merged" if existing_row["source"] == "sleeper" else existing_row["source"]
+                # Update in place: bind ourlads_id, set depth fields (if any),
+                # bump source to 'merged' if existing was 'sleeper'. Don't
+                # overwrite Sleeper-owned bio fields (first_name, last_name,
+                # birth_date, etc.) — only update what Ourlads observed.
+                update_fields = ["source = ?", "ourlads_id = COALESCE(?, ourlads_id)"]
+                update_values: list[Any] = [new_source, ourlads_id]
+                if "team" in row and row.get("team") is not None:
+                    update_fields.append("team = ?")
+                    update_values.append(row["team"])
+                if "position" in row and row.get("position") is not None:
+                    update_fields.append("position = ?")
+                    update_values.append(row["position"])
+                if jersey is not None:
+                    update_fields.append("number = ?")
+                    update_values.append(jersey)
+                depth_pos = row.get("depth_chart_position")
+                depth_order = row.get("depth_chart_order")
+                wrote_depth = False
+                if depth_pos is not None or depth_order is not None:
+                    update_fields.append("depth_chart_position = ?")
+                    update_values.append(depth_pos)
+                    update_fields.append("depth_chart_order = ?")
+                    update_values.append(depth_order)
+                    update_fields.append("depth_chart_last_observed_at = ?")
+                    update_values.append(run_start_at)
+                    wrote_depth = True
+                update_fields.append("updated_at = ?")
+                update_values.append(_now())
+                update_values.append(pid)
+                self.conn.execute(
+                    f"UPDATE players SET {', '.join(update_fields)} WHERE player_id = ?",
+                    tuple(update_values),
+                )
+                # If we didn't write depth this row but the row had depth
+                # fields set previously and Ourlads still saw the player,
+                # bump last_observed_at so R13 doesn't sweep them.
+                if not wrote_depth:
+                    self.conn.execute(
+                        "UPDATE players SET depth_chart_last_observed_at = ? "
+                        "WHERE player_id = ? AND depth_chart_position IS NOT NULL",
+                        (run_start_at, pid),
+                    )
+            else:
+                # Insert as Ourlads-only.
+                pid = (
+                    f"ourlads:{ourlads_id}"
+                    if ourlads_id
+                    else synthesize_ourlads_id(team, jersey, normalized)
+                )
+                self.conn.execute(
+                    "INSERT INTO players (player_id, full_name, team, position, "
+                    "number, depth_chart_position, depth_chart_order, updated_at, "
+                    "watchlist, source, ourlads_id, depth_chart_last_observed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'ourlads', ?, ?) "
+                    "ON CONFLICT(player_id) DO NOTHING",
+                    (
+                        pid,
+                        full_name,
+                        team,
+                        position,
+                        jersey,
+                        row.get("depth_chart_position"),
+                        row.get("depth_chart_order"),
+                        _now(),
+                        ourlads_id,
+                        run_start_at if row.get("depth_chart_position") else None,
+                    ),
+                )
+            written += 1
+
+        # R13 conditional clear + source demotion. For each fully-observed
+        # team, any source IN ('ourlads','merged') row on that team whose
+        # depth_chart_last_observed_at is older than this run's start has
+        # its depth fields cleared. Merged rows additionally demote back to
+        # 'sleeper' (clear ourlads_id) so Sleeper resumes ownership.
+        if completeness:
+            for team_abbr, was_complete in completeness.items():
+                if not was_complete:
+                    continue
+                # Demote merged rows that fell off the chart.
+                self.conn.execute(
+                    "UPDATE players SET source = 'sleeper', ourlads_id = NULL, "
+                    "depth_chart_position = NULL, depth_chart_order = NULL "
+                    "WHERE team = ? AND source = 'merged' AND ("
+                    "depth_chart_last_observed_at IS NULL "
+                    "OR depth_chart_last_observed_at < ?)",
+                    (team_abbr, run_start_at),
+                )
+                # Clear depth fields on Ourlads-only rows that fell off (but
+                # leave source='ourlads' — they have no Sleeper presence).
+                self.conn.execute(
+                    "UPDATE players SET depth_chart_position = NULL, "
+                    "depth_chart_order = NULL "
+                    "WHERE team = ? AND source = 'ourlads' AND ("
+                    "depth_chart_last_observed_at IS NULL "
+                    "OR depth_chart_last_observed_at < ?)",
+                    (team_abbr, run_start_at),
+                )
+        return written
+
     def get_player(self, player_id: str) -> dict[str, Any]:
         row = self.conn.execute(
             "SELECT * FROM players WHERE player_id = ?", (str(player_id),)
@@ -1045,11 +1375,28 @@ class Database:
 
     # --- sync runs ---
 
-    def record_sync_start(self, source_url: str) -> int:
+    def record_sync_start(self, source_url: str, source: str = "sleeper") -> int:
+        """Record the start of a sync run. Raises ConcurrentSyncError if another
+        run is already in flight (status='running' with started_at within the
+        last 5 minutes — older runs are treated as crashed and ignored).
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat(timespec="seconds")
+        existing = self.conn.execute(
+            "SELECT id, source FROM sync_runs WHERE status = 'running' "
+            "AND started_at > ?",
+            (cutoff,),
+        ).fetchone()
+        if existing is not None:
+            raise ConcurrentSyncError(
+                f"Another sync ({existing['source']}, run_id={existing['id']}) "
+                "is already running. Wait for it to finish or fail."
+            )
         cur = self.conn.execute(
-            "INSERT INTO sync_runs (started_at, source_url, status) "
-            "VALUES (?, ?, 'running')",
-            (_now(), source_url),
+            "INSERT INTO sync_runs (started_at, source_url, status, source) "
+            "VALUES (?, ?, 'running', ?)",
+            (_now(), source_url, source),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -1074,10 +1421,19 @@ class Database:
             raise NotFoundError(f"sync_run {run_id} not found")
         return _sync_run_row(row)
 
-    def last_sync(self) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+    def last_sync(self, source: str | None = None) -> dict[str, Any] | None:
+        """Return the most recent sync run. If `source` is given, restrict to
+        runs of that source (e.g. 'sleeper' or 'ourlads').
+        """
+        if source is None:
+            row = self.conn.execute(
+                "SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM sync_runs WHERE source = ? ORDER BY id DESC LIMIT 1",
+                (source,),
+            ).fetchone()
         return _sync_run_row(row) if row else None
 
     def close(self) -> None:
