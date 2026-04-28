@@ -1,6 +1,6 @@
 # MCP tools reference
 
-ffpresnap exposes 20 tools to Claude. You don't need to call these directly — Claude picks the right one when you describe what you want — but it's useful to know what's available.
+ffpresnap exposes 21 tools to Claude. You don't need to call these directly — Claude picks the right one when you describe what you want — but it's useful to know what's available.
 
 ## Sync
 

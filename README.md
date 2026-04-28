@@ -120,7 +120,7 @@ In Claude, ask:
 
 > *"What ffpresnap tools do you have?"*
 
-You should see 20 tools listed (`sync_players`, `get_sync_status`, `list_teams`, `get_depth_chart`, `add_note`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
+You should see 21 tools listed (`sync_players`, `get_sync_status`, `list_teams`, `get_depth_chart`, `add_note`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
 
 ---
 
