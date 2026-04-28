@@ -3,11 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
+import traceback
 from typing import Any
 
-from .db import AmbiguousTeamError, Database, NotFoundError
+from .db import (
+    AmbiguousTeamError,
+    ConcurrentSyncError,
+    Database,
+    NotFoundError,
+)
 from .sleeper import SleeperFetchError
 from .sync import run_sync
+
+
+# Tracks Ourlads sync background threads so they aren't garbage collected
+# mid-run. Thread bodies open their own DB connection via Database.open.
+_BACKGROUND_RUNS: dict[int, threading.Thread] = {}
 
 
 _MENTIONS_SCHEMA: dict[str, Any] = {
@@ -24,15 +36,55 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "sync_players",
         "description": (
-            "Pull the current NFL player set from Sleeper and replace local data. "
-            "Filters to fantasy positions (QB/RB/WR/TE/K/DEF). Records the run."
+            "Pull the current NFL player set from a source and merge into local "
+            "data. `source` is 'sleeper' (default) or 'ourlads'. Sleeper sync is "
+            "synchronous (~5s) and returns the full summary. Ourlads sync runs "
+            "in a background thread (~1-3 minutes for 33 page fetches) and "
+            "returns a `run_id` immediately — poll `get_sync_status(run_id)` "
+            "for progress. Records every run in `sync_runs`."
         ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": ["sleeper", "ourlads"],
+                    "default": "sleeper",
+                },
+            },
+        },
     },
     {
         "name": "last_sync",
-        "description": "Return the most recent sync run, or null if none has run yet.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "Return the most recent sync run, or null if none has run yet. "
+            "Optional `source` restricts to runs of that source."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": ["sleeper", "ourlads"],
+                },
+            },
+        },
+    },
+    {
+        "name": "get_sync_status",
+        "description": (
+            "Return the sync_runs row for a given `run_id` (or null if not "
+            "found). Use after starting an Ourlads sync via `sync_players` to "
+            "poll for completion. The row's `status` field becomes 'success' "
+            "or 'error' once the background run finishes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "integer"},
+            },
+            "required": ["run_id"],
+        },
     },
     # --- browse ---
     {
@@ -343,14 +395,102 @@ def _list_notes_dispatch(
     raise ToolError(f"Unknown scope: {scope!r}")
 
 
+def _start_background_ourlads_sync(db: Database) -> dict[str, Any]:
+    """Start an Ourlads sync in a daemon thread. Returns a run summary
+    immediately containing the run_id — poll get_sync_status to track
+    completion. The thread opens its own Database connection (sqlite3
+    connections are not safe to share across threads by default).
+
+    The advisory concurrency lock is acquired by run_sync via
+    record_sync_start in the worker thread; if a run is already in flight,
+    the worker thread surfaces the ConcurrentSyncError via sync_runs and
+    this function still returns a run summary. To present a clean error to
+    the caller when the lock is contended, we do a foreground pre-check.
+    """
+    # Pre-check the advisory lock so the caller sees a clean ToolError instead
+    # of an opaque "running" status that immediately flips to error.
+    from datetime import datetime, timedelta, timezone
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=5)
+    ).isoformat(timespec="seconds")
+    existing = db.conn.execute(
+        "SELECT id, source FROM sync_runs WHERE status = 'running' "
+        "AND started_at > ?",
+        (cutoff,),
+    ).fetchone()
+    if existing is not None:
+        raise ConcurrentSyncError(
+            f"Another sync ({existing['source']}, run_id={existing['id']}) "
+            "is already running. Wait for it to finish or fail."
+        )
+    if db.path is None:
+        raise RuntimeError(
+            "Cannot start a background Ourlads sync: Database has no path. "
+            "Open the Database via Database.open(...) so the worker thread "
+            "can attach its own connection."
+        )
+
+    db_path = str(db.path)
+
+    # Capture the highest existing ourlads run_id so we can detect the
+    # worker's record_sync_start landing as soon as the new id appears.
+    pre_run = db.last_sync(source="ourlads")
+    pre_id = pre_run["id"] if pre_run else 0
+
+    def worker(path: str) -> None:
+        bg = Database.open(path)
+        try:
+            try:
+                run_sync(bg, source="ourlads")
+            except Exception:
+                # run_sync records sync_runs failure on its own; this prints
+                # the traceback to stderr for operator visibility.
+                traceback.print_exc()
+        finally:
+            bg.close()
+
+    thread = threading.Thread(target=worker, args=(db_path,), daemon=True)
+    thread.start()
+
+    # Wait briefly for the worker's record_sync_start to land. We're done as
+    # soon as we observe a new ourlads run_id (regardless of its current
+    # status — by the time we poll, it may already have flipped to 'error'
+    # for fast-failing runs like the current Unit 4 stub).
+    import time
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        latest = db.last_sync(source="ourlads")
+        if latest is not None and latest["id"] > pre_id:
+            _BACKGROUND_RUNS[latest["id"]] = thread
+            return {
+                "run_id": latest["id"],
+                "status": latest["status"],
+                "source": "ourlads",
+                "started_at": latest["started_at"],
+                "finished_at": latest.get("finished_at"),
+                "error": latest.get("error"),
+            }
+        time.sleep(0.05)
+    # Worker didn't register in time — surface that.
+    raise ToolError(
+        "Ourlads sync background thread failed to start within 2s; "
+        "check stderr for traceback."
+    )
+
+
 def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
     """Pure dispatch over tool name. Raises ToolError on user-facing failures."""
     args = args or {}
     try:
         if name == "sync_players":
-            return run_sync(db)
+            source = args.get("source", "sleeper")
+            if source == "ourlads":
+                return _start_background_ourlads_sync(db)
+            return run_sync(db, source=source)
         if name == "last_sync":
-            return db.last_sync()
+            return db.last_sync(source=args.get("source"))
+        if name == "get_sync_status":
+            return db.get_sync_run(int(args["run_id"]))
         if name == "list_teams":
             return db.list_teams(args.get("query"))
         if name == "get_team":
@@ -442,6 +582,8 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
         raise ToolError(str(e)) from e
     except SleeperFetchError as e:
         raise ToolError(f"Sleeper sync failed: {e}") from e
+    except ConcurrentSyncError as e:
+        raise ToolError(str(e)) from e
     except KeyError as e:
         raise ToolError(f"Missing required argument: {e.args[0]}") from e
 

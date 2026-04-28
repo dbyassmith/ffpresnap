@@ -56,13 +56,25 @@ def run_sync(
     if source == "sleeper":
         return _run_sleeper_sync(db, fetch=fetch, source_url=source_url)
     if source == "ourlads":
-        # Stubbed until Unit 4 lands the Ourlads pipeline. The tool surface
-        # exists; the runtime path raises a clear NotImplementedError so users
-        # invoking it pre-Unit-4 see exactly what's missing.
-        raise NotImplementedError(
-            "Ourlads sync pipeline lands in a follow-up unit; not yet wired."
-        )
+        return _run_ourlads_sync_stub(db, source_url=source_url)
     raise ValueError(f"Unknown sync source: {source!r}")
+
+
+def _run_ourlads_sync_stub(
+    db: Database, *, source_url: str | None
+) -> dict[str, Any]:
+    """Placeholder Ourlads sync. Records sync_runs lifecycle correctly so
+    callers can poll get_sync_status; the actual fetch + parse logic lands
+    in Unit 4. For now this records the run start, then immediately records
+    a failure with a NotImplementedError-style message so the background
+    worker's behavior is observable end-to-end.
+    """
+    if source_url is None:
+        source_url = "https://www.ourlads.com/nfldepthcharts/"
+    run_id = db.record_sync_start(source_url, source="ourlads")
+    err_msg = "Ourlads sync pipeline lands in Unit 4; not yet wired."
+    db.record_sync_finish(run_id, 0, "error", error=err_msg)
+    raise NotImplementedError(err_msg)
 
 
 def _run_sleeper_sync(

@@ -232,8 +232,11 @@ def _sync_run_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 class Database:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(
+        self, conn: sqlite3.Connection, *, path: str | Path | None = None
+    ):
         self.conn = conn
+        self.path = Path(path) if path is not None else None
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._migrate()
@@ -245,7 +248,7 @@ class Database:
         resolved = cls.resolve_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(resolved))
-        return cls(conn)
+        return cls(conn, path=resolved)
 
     @staticmethod
     def resolve_path(path: str | Path | None = None) -> Path:
@@ -1453,6 +1456,13 @@ class Database:
         if row is None:
             raise NotFoundError(f"sync_run {run_id} not found")
         return _sync_run_row(row)
+
+    def get_sync_run(self, run_id: int) -> dict[str, Any] | None:
+        """Return a single sync_runs row by id, or None if not found."""
+        row = self.conn.execute(
+            "SELECT * FROM sync_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return _sync_run_row(row) if row else None
 
     def last_sync(self, source: str | None = None) -> dict[str, Any] | None:
         """Return the most recent sync run. If `source` is given, restrict to
