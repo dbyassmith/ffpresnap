@@ -30,7 +30,7 @@ def test_cli_main_happy_path(env_db, capsys, monkeypatch):
         "fetch_players",
         lambda url: {"1": _sleeper_player("1"), "2": _sleeper_player("2")},
     )
-    rc = cli.main()
+    rc = cli.main([])
     assert rc == 0
     out = capsys.readouterr().out
     assert "synced 2 players" in out
@@ -52,7 +52,7 @@ def test_cli_main_failure_returns_nonzero_and_records_error(
         raise SleeperFetchError("fetch failed")
 
     monkeypatch.setattr(sleeper_module, "fetch_players", boom)
-    rc = cli.main()
+    rc = cli.main([])
     assert rc == 1
     err = capsys.readouterr().err
     assert "sync failed" in err and "fetch failed" in err
@@ -64,3 +64,33 @@ def test_cli_main_failure_returns_nonzero_and_records_error(
         assert "fetch failed" in last["error"]
     finally:
         db.close()
+
+
+def test_cli_explicit_sleeper_source(env_db, capsys, monkeypatch):
+    monkeypatch.setattr(
+        sleeper_module,
+        "fetch_players",
+        lambda url: {"1": _sleeper_player("1")},
+    )
+    rc = cli.main(["--source", "sleeper"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "synced 1 players" in out
+    assert "source=sleeper" in out
+
+
+def test_cli_ourlads_source_not_yet_wired(env_db, capsys):
+    """Ourlads source dispatches but raises NotImplementedError until Unit 4."""
+    rc = cli.main(["--source", "ourlads"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "sync failed" in err
+    assert "Ourlads" in err  # NotImplementedError mentions Ourlads
+
+
+def test_cli_invalid_source_exits_nonzero(env_db, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--source", "bogus"])
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "invalid choice" in err or "bogus" in err
