@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
+from . import ourlads as _ourlads
 from . import sleeper as _sleeper
 from .db import PLAYER_FIELDS, Database, _now
+from .ourlads import OURLADS_ALL_CHART_URL
 from .sleeper import PLAYERS_URL
 
 
@@ -56,25 +58,64 @@ def run_sync(
     if source == "sleeper":
         return _run_sleeper_sync(db, fetch=fetch, source_url=source_url)
     if source == "ourlads":
-        return _run_ourlads_sync_stub(db, source_url=source_url)
+        return _run_ourlads_sync(db, fetch=fetch, source_url=source_url)
     raise ValueError(f"Unknown sync source: {source!r}")
 
 
-def _run_ourlads_sync_stub(
-    db: Database, *, source_url: str | None
+def _run_ourlads_sync(
+    db: Database,
+    *,
+    fetch: FetchFn | None = None,
+    source_url: str | None = None,
 ) -> dict[str, Any]:
-    """Placeholder Ourlads sync. Records sync_runs lifecycle correctly so
-    callers can poll get_sync_status; the actual fetch + parse logic lands
-    in Unit 4. For now this records the run start, then immediately records
-    a failure with a NotImplementedError-style message so the background
-    worker's behavior is observable end-to-end.
+    """Pull rosters + the all-teams chart from Ourlads.com, merge into the
+    players table via upsert_players_for_source('ourlads'). Records
+    sync_runs.error with the per-team failure list when partial.
     """
     if source_url is None:
-        source_url = "https://www.ourlads.com/nfldepthcharts/"
+        source_url = OURLADS_ALL_CHART_URL
+    run_start_at = _now()
     run_id = db.record_sync_start(source_url, source="ourlads")
-    err_msg = "Ourlads sync pipeline lands in Unit 4; not yet wired."
-    db.record_sync_finish(run_id, 0, "error", error=err_msg)
-    raise NotImplementedError(err_msg)
+    try:
+        # `fetch` here is the raw bytes-returning Fetcher seam. _ourlads
+        # owns its own default; tests inject a fake.
+        result = _ourlads.fetch_all(fetcher=fetch)
+        if len(result.errors) > _ourlads.MAX_FAILED_TEAMS:
+            err_summary = ",".join(
+                f"{e.team}:{e.reason}" for e in result.errors[:10]
+            )
+            raise RuntimeError(
+                f"Ourlads sync exceeded MAX_FAILED_TEAMS={_ourlads.MAX_FAILED_TEAMS} "
+                f"(got {len(result.errors)}): {err_summary}"
+            )
+        written = db.upsert_players_for_source(
+            "ourlads",
+            result.rows,
+            completeness=result.completeness,
+            run_start_at=run_start_at,
+        )
+        # Surface per-team failures even on a success run via sync_runs.error.
+        error_text = (
+            ",".join(f"{e.team}:{e.reason}" for e in result.errors)
+            if result.errors
+            else None
+        )
+        finished = db.record_sync_finish(run_id, written, "success", error=error_text)
+        return {
+            "run_id": run_id,
+            "players_written": written,
+            "status": "success",
+            "source": "ourlads",
+            "started_at": finished["started_at"],
+            "finished_at": finished["finished_at"],
+            "error": error_text,
+            "team_errors": [
+                {"team": e.team, "reason": e.reason} for e in result.errors
+            ],
+        }
+    except Exception as e:
+        db.record_sync_finish(run_id, 0, "error", error=str(e))
+        raise
 
 
 def _run_sleeper_sync(

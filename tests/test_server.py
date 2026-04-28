@@ -94,24 +94,35 @@ def test_sync_players_explicit_sleeper_source(db, monkeypatch):
     assert summary["source"] == "sleeper"
 
 
-def test_sync_players_ourlads_source_returns_run_id_and_runs_in_background(
-    db, monkeypatch
-):
-    """Ourlads sync starts a background thread and returns a run_id. The
-    actual pipeline lands in Unit 4 — until then the stub records the start,
-    flips to 'error' immediately, and the run_id remains queryable via
-    get_sync_status."""
+def test_sync_players_ourlads_source_runs_in_background(db, monkeypatch):
+    """Ourlads sync starts a background thread and returns a run_id. With
+    fixture-backed fetcher, the run completes successfully in <2s."""
+    from pathlib import Path
+
+    from ffpresnap import ourlads as ourlads_module
+
+    fixtures = Path(__file__).parent / "fixtures" / "ourlads"
+    roster_html = (fixtures / "roster_ATL.html").read_bytes()
+    chart_html = (fixtures / "all_chart.html").read_bytes()
+
+    def fake_fetch(url: str) -> bytes:
+        if url == ourlads_module.OURLADS_ALL_CHART_URL:
+            return chart_html
+        return roster_html
+
+    monkeypatch.setattr(ourlads_module, "_default_fetch", fake_fetch)
+    monkeypatch.setattr(ourlads_module, "DEFAULT_DELAY_SECONDS", 0.0)
+
     summary = handle_tool_call(db, "sync_players", {"source": "ourlads"})
     assert summary["source"] == "ourlads"
-    # Status may be 'running' or 'error' depending on whether the foreground
-    # polled before the worker's record_sync_finish landed.
-    assert summary["status"] in ("running", "error")
+    # Status may be 'running' or 'success' depending on timing.
+    assert summary["status"] in ("running", "success")
     run_id = summary["run_id"]
     assert run_id > 0
 
-    # Wait up to 2s for the worker thread's record_sync_finish.
+    # Wait up to 5s for the worker thread to finish.
     import time
-    deadline = time.monotonic() + 2.0
+    deadline = time.monotonic() + 5.0
     final = None
     while time.monotonic() < deadline:
         final = handle_tool_call(db, "get_sync_status", {"run_id": run_id})
@@ -119,8 +130,8 @@ def test_sync_players_ourlads_source_returns_run_id_and_runs_in_background(
             break
         time.sleep(0.05)
     assert final is not None
-    assert final["status"] == "error"
-    assert "Unit 4" in (final["error"] or "")
+    assert final["status"] == "success"
+    assert (final["players_written"] or 0) > 0
 
 
 def test_get_sync_status_returns_none_for_unknown_run(db):

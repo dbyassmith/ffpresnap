@@ -79,13 +79,31 @@ def test_cli_explicit_sleeper_source(env_db, capsys, monkeypatch):
     assert "source=sleeper" in out
 
 
-def test_cli_ourlads_source_not_yet_wired(env_db, capsys):
-    """Ourlads source dispatches but raises NotImplementedError until Unit 4."""
+def test_cli_ourlads_source_runs_against_fake_fetcher(env_db, capsys, monkeypatch):
+    """Ourlads source fetches via the Fetcher seam. With a fake fetcher
+    returning one team's roster + the all-teams chart fixture, the CLI
+    completes successfully."""
+    from pathlib import Path
+
+    from ffpresnap import ourlads as ourlads_module
+
+    fixtures = Path(__file__).parent / "fixtures" / "ourlads"
+    roster_html = (fixtures / "roster_ATL.html").read_bytes()
+    chart_html = (fixtures / "all_chart.html").read_bytes()
+
+    def fake_fetch(url: str) -> bytes:
+        if url == ourlads_module.OURLADS_ALL_CHART_URL:
+            return chart_html
+        return roster_html
+
+    monkeypatch.setattr(ourlads_module, "_default_fetch", fake_fetch)
+    # Also drop the politeness sleep to keep the test fast.
+    monkeypatch.setattr(ourlads_module, "DEFAULT_DELAY_SECONDS", 0.0)
+
     rc = cli.main(["--source", "ourlads"])
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "sync failed" in err
-    assert "Ourlads" in err  # NotImplementedError mentions Ourlads
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "source=ourlads" in out
 
 
 def test_cli_invalid_source_exits_nonzero(env_db, capsys):
