@@ -882,6 +882,15 @@ class Database:
                 "DELETE FROM players WHERE source = 'sleeper'"
             )
 
+        # Suffix-variant cleanup: collapse Ourlads-only rows whose
+        # normalized name (with suffix-strip) now matches an existing
+        # Sleeper or merged row on the same team+position. This catches
+        # historical duplicates created when sources disagree on whether
+        # to write "Marvin Harrison" vs "Marvin Harrison Jr". Runs after
+        # the per-row UPSERT above so newly-written Sleeper rows are
+        # eligible targets.
+        self._merge_suffix_variant_duplicates()
+
         # Orphan-note cleanup: any player-subject note pointing at a player_id
         # no longer in the table (notes table is polymorphic, no FK cascade).
         self.conn.execute(
@@ -889,6 +898,70 @@ class Database:
             "AND subject_id NOT IN (SELECT player_id FROM players)"
         )
         return len(validated)
+
+    def _merge_suffix_variant_duplicates(self) -> int:
+        """One-time / per-sync sweep that collapses Ourlads-only rows
+        whose suffix-stripped normalized name + team + position matches
+        an existing source IN ('sleeper','merged') row. The Sleeper /
+        merged row wins (keeps its pid); the Ourlads-only row's notes,
+        mentions, and feed_items get rewritten to the winning pid, then
+        the duplicate row is deleted.
+
+        Returns the number of rows merged. Safe to run on a clean DB
+        (returns 0).
+        """
+        # Pull all Ourlads-only rows; pull all sleeper/merged rows. Bucket
+        # both by (team, position, normalized_name) and look for hits.
+        ourlads_rows = self.conn.execute(
+            "SELECT player_id, full_name, team, position FROM players "
+            "WHERE source = 'ourlads'"
+        ).fetchall()
+        if not ourlads_rows:
+            return 0
+        keep_index: dict[tuple[str, str, str], str] = {}
+        for r in self.conn.execute(
+            "SELECT player_id, full_name, team, position FROM players "
+            "WHERE source IN ('sleeper', 'merged')"
+        ).fetchall():
+            key = (
+                r["team"] or "",
+                r["position"] or "",
+                normalize_full_name(r["full_name"] or ""),
+            )
+            # First write wins (deterministic, but in practice no collisions
+            # since Sleeper has stable distinct pids).
+            keep_index.setdefault(key, r["player_id"])
+
+        merged = 0
+        for r in ourlads_rows:
+            key = (
+                r["team"] or "",
+                r["position"] or "",
+                normalize_full_name(r["full_name"] or ""),
+            )
+            keeper = keep_index.get(key)
+            if keeper is None or keeper == r["player_id"]:
+                continue
+            old_pid = r["player_id"]
+            # Rewrite all references to the loser.
+            self.conn.execute(
+                "UPDATE notes SET subject_id = ? "
+                "WHERE subject_type = 'player' AND subject_id = ?",
+                (keeper, old_pid),
+            )
+            self.conn.execute(
+                "UPDATE note_player_mentions SET player_id = ? WHERE player_id = ?",
+                (keeper, old_pid),
+            )
+            self.conn.execute(
+                "UPDATE feed_items SET player_id = ? WHERE player_id = ?",
+                (keeper, old_pid),
+            )
+            self.conn.execute(
+                "DELETE FROM players WHERE player_id = ?", (old_pid,)
+            )
+            merged += 1
+        return merged
 
     def _upsert_ourlads_rows(
         self,

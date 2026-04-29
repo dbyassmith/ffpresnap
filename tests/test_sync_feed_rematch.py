@@ -267,3 +267,75 @@ def test_sleeper_merge_preserves_feed_items_player_id(db):
     notes = db.list_notes("JJ-S")
     assert len(notes) == 1
     assert notes[0]["body"].startswith("Body")
+
+
+# --- suffix-variant dedupe ---
+
+
+def test_sleeper_sync_merges_suffix_variant_duplicates(db):
+    """Pre-existing dupe scenario: Sleeper has 'Marvin Harrison Jr' and
+    Ourlads has 'Marvin Harrison' on the same team+position. After the
+    suffix-strip change, both normalize to the same key. The next
+    Sleeper sync's tail-of-pass dedupe sweep should collapse the
+    Ourlads-only row into the Sleeper row, transferring notes / mentions
+    / feed_items.
+    """
+    # Seed the duplicate state directly so we test the cleanup sweep.
+    db.conn.execute(
+        "INSERT INTO players ("
+        "  player_id, full_name, team, position, fantasy_positions, "
+        "  updated_at, watchlist, source"
+        ") VALUES ('ourlads:abc', 'Marvin Harrison', 'ARI', 'WR', ?, ?, 0, 'ourlads')",
+        (json.dumps(["WR"]), "2026-04-29T00:00:00Z"),
+    )
+    db.conn.commit()
+
+    # Drop a feed item bound to the Ourlads-only pid (simulates the user
+    # having attached beat-writer nuggets to the duplicate).
+    db.add_feed_item_with_auto_note(
+        "32beatwriters",
+        {
+            "external_id": "32bw:dup",
+            "external_player_id": "ext-1",
+            "external_player_name": "Marvin Harrison",
+            "external_team": "Arizona Cardinals",
+            "external_position": "WR",
+            "team_abbr": "ARI",
+            "source_url": "u",
+            "source_author": "r",
+            "raw_html": "<p>x</p>",
+            "cleaned_text": "x",
+            "created_at": "2026-04-29T00:00:00Z",
+        },
+        player_id="ourlads:abc",
+        note_body="Body for dup",
+        run_id=1,
+    )
+
+    # Sleeper sync brings in 'Marvin Harrison Jr' as a separate Sleeper-pid row.
+    payload = {
+        "MH-S": {
+            "player_id": "MH-S",
+            "full_name": "Marvin Harrison Jr.",
+            "team": "ARI",
+            "position": "WR",
+            "fantasy_positions": ["WR"],
+        },
+    }
+    run_sync(db, source="sleeper", fetch=lambda url: payload, source_url="u")
+
+    # The Ourlads-only row got merged away. Sleeper row remains.
+    assert (
+        db.conn.execute(
+            "SELECT 1 FROM players WHERE player_id = 'ourlads:abc'"
+        ).fetchone()
+        is None
+    )
+    assert db.get_player("MH-S")["full_name"] == "Marvin Harrison Jr."
+
+    # Feed items + auto-note transferred to the Sleeper pid.
+    fi = db.list_feed_items()[0]
+    assert fi["player_id"] == "MH-S"
+    notes = db.list_notes("MH-S")
+    assert len(notes) == 1
+    assert notes[0]["body"].startswith("Body for dup")

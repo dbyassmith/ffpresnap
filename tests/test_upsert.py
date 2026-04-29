@@ -569,7 +569,12 @@ def test_find_player_for_match_handles_diacritics(tmp_path):
         db.close()
 
 
-def test_find_player_for_match_distinguishes_suffixes(tmp_path):
+def test_find_player_for_match_collapses_suffix_variants(tmp_path):
+    """Suffix-strip means a 'Marvin Harrison' nugget matches a 'Marvin
+    Harrison Jr' player row (and vice versa). The genuine same-team
+    namesake case (extremely rare in NFL) returns >1 candidates and the
+    caller skips — collapse-then-disambiguate rather than never-collapse.
+    """
     db = _open(tmp_path)
     try:
         db.upsert_players_for_source(
@@ -581,9 +586,18 @@ def test_find_player_for_match_distinguishes_suffixes(tmp_path):
                              position="WR"),
             ],
         )
-        senior = db.find_player_for_match("marvin harrison", "ARI", "WR")
-        junior = db.find_player_for_match("marvin harrison jr", "ARI", "WR")
-        assert len(senior) == 1 and senior[0]["player_id"] == "100"
-        assert len(junior) == 1 and junior[0]["player_id"] == "101"
+        # Callers pass already-normalized names. Both Sleeper rows
+        # normalize to the same key, so the lookup returns both —
+        # callers treat len > 1 as ambiguous and skip.
+        from ffpresnap._naming import normalize_full_name
+
+        senior = db.find_player_for_match(
+            normalize_full_name("Marvin Harrison"), "ARI", "WR"
+        )
+        junior = db.find_player_for_match(
+            normalize_full_name("Marvin Harrison Jr."), "ARI", "WR"
+        )
+        assert {p["player_id"] for p in senior} == {"100", "101"}
+        assert {p["player_id"] for p in junior} == {"100", "101"}
     finally:
         db.close()
