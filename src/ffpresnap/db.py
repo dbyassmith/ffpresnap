@@ -900,67 +900,98 @@ class Database:
         return len(validated)
 
     def _merge_suffix_variant_duplicates(self) -> int:
-        """One-time / per-sync sweep that collapses Ourlads-only rows
-        whose suffix-stripped normalized name + team + position matches
-        an existing source IN ('sleeper','merged') row. The Sleeper /
-        merged row wins (keeps its pid); the Ourlads-only row's notes,
-        mentions, and feed_items get rewritten to the winning pid, then
-        the duplicate row is deleted.
+        """Per-sync sweep that collapses any rows whose normalized name +
+        team + position collide.
 
-        Returns the number of rows merged. Safe to run on a clean DB
-        (returns 0).
+        Two failure modes get cleaned up here:
+
+        1. **Cross-source dupes** — the same player appears as a Sleeper
+           (or merged) row AND an Ourlads-only row, because sources
+           disagreed about a Jr/Sr/II/III/IV suffix at the time of
+           identity-merge. The Sleeper / merged row wins (stable pid).
+
+        2. **Intra-Ourlads dupes** — Ourlads occasionally lists the
+           same player twice on its all-teams chart with different name
+           variants (e.g. "Michael Penix Jr." at QB#1 and "Michael
+           Penix" at QB#2). Picks a deterministic keeper and merges
+           the rest into it.
+
+        For each colliding bucket the keeper is chosen by:
+          1. Prefer ``source IN ('sleeper','merged')`` over ``'ourlads'``
+          2. Prefer the row with the lowest ``depth_chart_order`` (1 = starter)
+          3. Tie-break by longest ``full_name`` (more complete metadata)
+          4. Tie-break by lowest ``player_id`` (oldest / most stable)
+
+        Notes, mentions, and feed_items pointing at the loser pids get
+        rewritten to the keeper's pid; the duplicate rows are deleted.
+        Returns the number of rows merged.
         """
-        # Pull all Ourlads-only rows; pull all sleeper/merged rows. Bucket
-        # both by (team, position, normalized_name) and look for hits.
-        ourlads_rows = self.conn.execute(
-            "SELECT player_id, full_name, team, position FROM players "
-            "WHERE source = 'ourlads'"
+        rows = self.conn.execute(
+            "SELECT player_id, full_name, team, position, source, "
+            "depth_chart_order FROM players"
         ).fetchall()
-        if not ourlads_rows:
+        if not rows:
             return 0
-        keep_index: dict[tuple[str, str, str], str] = {}
-        for r in self.conn.execute(
-            "SELECT player_id, full_name, team, position FROM players "
-            "WHERE source IN ('sleeper', 'merged')"
-        ).fetchall():
-            key = (
-                r["team"] or "",
-                r["position"] or "",
-                normalize_full_name(r["full_name"] or ""),
+
+        buckets: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        for r in rows:
+            normalized = normalize_full_name(r["full_name"] or "")
+            if not normalized:
+                continue
+            key = (r["team"] or "", r["position"] or "", normalized)
+            buckets.setdefault(key, []).append(r)
+
+        def keeper_sort_key(r: sqlite3.Row) -> tuple[int, int, int, str]:
+            source_pref = 0 if r["source"] in ("sleeper", "merged") else 1
+            order = (
+                r["depth_chart_order"]
+                if r["depth_chart_order"] is not None
+                else 1_000_000
             )
-            # First write wins (deterministic, but in practice no collisions
-            # since Sleeper has stable distinct pids).
-            keep_index.setdefault(key, r["player_id"])
+            name_len_neg = -len(r["full_name"] or "")
+            return (source_pref, order, name_len_neg, r["player_id"])
 
         merged = 0
-        for r in ourlads_rows:
-            key = (
-                r["team"] or "",
-                r["position"] or "",
-                normalize_full_name(r["full_name"] or ""),
-            )
-            keeper = keep_index.get(key)
-            if keeper is None or keeper == r["player_id"]:
+        for group in buckets.values():
+            if len(group) < 2:
                 continue
-            old_pid = r["player_id"]
-            # Rewrite all references to the loser.
-            self.conn.execute(
-                "UPDATE notes SET subject_id = ? "
-                "WHERE subject_type = 'player' AND subject_id = ?",
-                (keeper, old_pid),
-            )
-            self.conn.execute(
-                "UPDATE note_player_mentions SET player_id = ? WHERE player_id = ?",
-                (keeper, old_pid),
-            )
-            self.conn.execute(
-                "UPDATE feed_items SET player_id = ? WHERE player_id = ?",
-                (keeper, old_pid),
-            )
-            self.conn.execute(
-                "DELETE FROM players WHERE player_id = ?", (old_pid,)
-            )
-            merged += 1
+            # Only collapse buckets where at least one row is
+            # Ourlads-sourced — Sleeper IDs are authoritative, never
+            # merge across two distinct stable Sleeper pids even if
+            # they happen to normalize to the same key.
+            if not any(r["source"] == "ourlads" for r in group):
+                continue
+            # Genuine ambiguity guard: if multiple non-Ourlads rows
+            # exist in the same bucket, we cannot safely pick which
+            # Sleeper player the Ourlads-only row(s) belong to. Leave
+            # the bucket alone — the Ourlads rows stay as
+            # ourlads-only, mirroring the existing ambiguous-match
+            # posture of `find_player_for_match`.
+            non_ourlads = [r for r in group if r["source"] != "ourlads"]
+            if len(non_ourlads) > 1:
+                continue
+            sorted_group = sorted(group, key=keeper_sort_key)
+            keeper_pid = sorted_group[0]["player_id"]
+            for loser in sorted_group[1:]:
+                old_pid = loser["player_id"]
+                self.conn.execute(
+                    "UPDATE notes SET subject_id = ? "
+                    "WHERE subject_type = 'player' AND subject_id = ?",
+                    (keeper_pid, old_pid),
+                )
+                self.conn.execute(
+                    "UPDATE note_player_mentions SET player_id = ? "
+                    "WHERE player_id = ?",
+                    (keeper_pid, old_pid),
+                )
+                self.conn.execute(
+                    "UPDATE feed_items SET player_id = ? WHERE player_id = ?",
+                    (keeper_pid, old_pid),
+                )
+                self.conn.execute(
+                    "DELETE FROM players WHERE player_id = ?", (old_pid,)
+                )
+                merged += 1
         return merged
 
     def _upsert_ourlads_rows(
@@ -1107,6 +1138,13 @@ class Database:
                     "OR depth_chart_last_observed_at < ?)",
                     (team_abbr, run_start_at),
                 )
+
+        # Tail-of-sync dupe collapse — handles the intra-Ourlads case
+        # where the same player appeared on the chart twice with
+        # different name variants (e.g. "Michael Penix Jr." at QB#1 and
+        # "Michael Penix" at QB#2). Same sweep also fires at the tail
+        # of Sleeper sync; running either source will clean up dupes.
+        self._merge_suffix_variant_duplicates()
         return written
 
     def get_player(self, player_id: str) -> dict[str, Any]:

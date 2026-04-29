@@ -339,3 +339,69 @@ def test_sleeper_sync_merges_suffix_variant_duplicates(db):
     notes = db.list_notes("MH-S")
     assert len(notes) == 1
     assert notes[0]["body"].startswith("Body for dup")
+
+
+def test_dedupe_collapses_intra_ourlads_name_variants(db):
+    """Mirrors a real-world Ourlads quirk: the same player listed twice
+    on the all-teams chart with different name variants (e.g. Michael
+    Penix Jr. at QB#1 and Michael Penix at QB#2). Both end up as
+    source='ourlads' rows with no Sleeper match. The dedupe sweep
+    collapses them into one, keeping the row with the lower
+    depth_chart_order (starter slot beats backup) and longer name.
+    """
+    # Two Ourlads-only rows for the same player, same jersey, different
+    # depth chart slots and name forms.
+    db.conn.execute(
+        "INSERT INTO players ("
+        "  player_id, full_name, team, position, fantasy_positions,"
+        "  number, depth_chart_position, depth_chart_order, updated_at,"
+        "  watchlist, source"
+        ") VALUES "
+        "('ourlads:penix-jr', 'Michael Penix Jr.', 'ATL', 'QB', ?, '9',"
+        " 'QB', 1, '2026-04-29T00:00:00Z', 0, 'ourlads'),"
+        "('ourlads:penix', 'Michael Penix', 'ATL', 'QB', ?, '9',"
+        " 'QB', 2, '2026-04-29T00:00:00Z', 0, 'ourlads')",
+        (json.dumps(["QB"]), json.dumps(["QB"])),
+    )
+    db.conn.commit()
+
+    # Attach a feed item to the loser-side row to verify rewrite.
+    db.add_feed_item_with_auto_note(
+        "32beatwriters",
+        {
+            "external_id": "32bw:penix",
+            "external_player_id": "ext-1",
+            "external_player_name": "Michael Penix",
+            "external_team": "Atlanta Falcons",
+            "external_position": "QB",
+            "team_abbr": "ATL",
+            "source_url": "u",
+            "source_author": "r",
+            "raw_html": "<p>x</p>",
+            "cleaned_text": "x",
+            "created_at": "2026-04-29T00:00:00Z",
+        },
+        player_id="ourlads:penix",
+        note_body="Note on the dupe",
+        run_id=1,
+    )
+
+    merged = db._merge_suffix_variant_duplicates()
+    assert merged == 1
+
+    survivors = db.conn.execute(
+        "SELECT player_id, full_name, depth_chart_order FROM players "
+        "WHERE team = 'ATL' AND position = 'QB' AND source = 'ourlads'"
+    ).fetchall()
+    assert len(survivors) == 1
+    # The depth_chart_order=1 row (starter slot) wins — it also has the
+    # longer "Jr." name, so both heuristics agree here.
+    assert survivors[0]["player_id"] == "ourlads:penix-jr"
+    assert survivors[0]["depth_chart_order"] == 1
+
+    # The feed item that pointed at the loser pid was rewritten.
+    fi = db.list_feed_items()[0]
+    assert fi["player_id"] == "ourlads:penix-jr"
+    notes = db.list_notes("ourlads:penix-jr")
+    assert len(notes) == 1
+    assert notes[0]["body"].startswith("Note on the dupe")
