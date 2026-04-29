@@ -49,30 +49,34 @@ pip install -e .
 This installs two console scripts inside the venv:
 
 - **`ffpresnap-mcp`** — the MCP server Claude talks to.
-- **`ffpresnap-sync`** — pulls the latest NFL player data from Sleeper into your local DB.
+- **`ffpresnap-sync`** — pulls the latest NFL player data (Sleeper, Ourlads) and beat-reporter feeds (32beatwriters) into your local DB.
 
 > **Tip:** running `which ffpresnap-mcp` (macOS/Linux) or `where ffpresnap-mcp` (Windows) prints the absolute path. Some Claude clients prefer the absolute path in their config — see the next step.
 
 ### 3. Pull the initial player data
 
 ```bash
-ffpresnap-sync                      # default source: sleeper
-ffpresnap-sync --source=ourlads     # optional: layer Ourlads depth charts on top
+ffpresnap-sync                            # default source: sleeper
+ffpresnap-sync --source=ourlads           # optional: layer Ourlads depth charts on top
+ffpresnap-sync --source=32beatwriters     # optional: pull beat-reporter nuggets as auto-notes
+ffpresnap-sync --source=32beatwriters --full   # backfill the entire feed (first-run or reconcile)
 ```
 
 You should see something like `synced 4231 players in 0.4s (run_id=1, source=sleeper)`. The Sleeper sync filters to fantasy-relevant positions (QB, RB, WR, TE, K, DEF) and writes them to `~/.ffpresnap/notes.db`.
 
 The optional **Ourlads** sync layers hand-curated, beat-reporter-driven depth charts on top of Sleeper's data. It fetches 32 team rosters plus one all-teams depth-chart page from [ourlads.com](https://www.ourlads.com/nfldepthcharts/) (~1-3 minutes total at the polite 1.5s/request default) and merges them into the same `players` table — without disturbing your Sleeper-sourced notes. Players Ourlads tracks but Sleeper hasn't picked up yet (practice-squad call-ups, recent signings) become first-class entries you can attach notes to.
 
-You can rerun either source whenever you want fresh data. A reasonable daily cron does both, in order:
+The optional **32beatwriters** feed sync pulls paginated beat-reporter "nuggets" from [api.32beatwriters.com](https://api.32beatwriters.com/) and turns each one into a searchable note on the matched player — same `notes` shape as anything you'd write yourself, just with a source/author/url footer at the bottom. Items about players Sleeper doesn't carry (rookies, prospects) are stored unmatched and back-attached automatically the next time their player appears. The default incremental walk is bounded; use `--full` for first-run backfill. Adding more feed sources later is one new adapter file (see `src/ffpresnap/feeds/`).
+
+You can rerun any source whenever you want fresh data. A reasonable daily cron does all three in order:
 
 ```cron
-0 9 * * * /absolute/path/to/.venv/bin/ffpresnap-sync --source=sleeper && /absolute/path/to/.venv/bin/ffpresnap-sync --source=ourlads
+0 9 * * * /absolute/path/to/.venv/bin/ffpresnap-sync --source=sleeper && /absolute/path/to/.venv/bin/ffpresnap-sync --source=ourlads && /absolute/path/to/.venv/bin/ffpresnap-sync --source=32beatwriters
 ```
 
-(Per-field ownership means Ourlads owns `depth_chart_position` / `_order` once it has touched a row, so cron ordering doesn't actually matter — but Sleeper-then-Ourlads is the more intuitive sequence.)
+(Per-field ownership means Ourlads owns `depth_chart_position` / `_order` once it has touched a row, so cron ordering doesn't actually matter for player-data sources — but Sleeper-then-Ourlads-then-feeds is the most intuitive sequence.)
 
-You can also ask Claude to run `sync_players` from inside a chat once the MCP is connected. Sleeper sync returns a summary inline (~5s); Ourlads sync runs in a background thread and returns a `run_id` immediately — Claude polls `get_sync_status(run_id)` to track completion.
+You can also ask Claude to run `sync(source=...)` from inside a chat once the MCP is connected. Sleeper sync returns a summary inline (~5s); Ourlads and feed syncs run in a background thread and return a `run_id` immediately — Claude polls `get_sync_status(run_id)` to track completion.
 
 ### 4. Connect to Claude
 
@@ -120,7 +124,7 @@ In Claude, ask:
 
 > *"What ffpresnap tools do you have?"*
 
-You should see 21 tools listed (`sync_players`, `get_sync_status`, `list_teams`, `get_depth_chart`, `add_note`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
+You should see 24 tools listed (`sync`, `get_sync_status`, `list_teams`, `get_depth_chart`, `add_note`, `list_feed_items`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
 
 ---
 
