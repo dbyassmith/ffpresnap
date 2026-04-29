@@ -1,7 +1,7 @@
 ---
 title: "feat: Generic feed ingestion with 32beatwriters as first source"
 type: feat
-status: active
+status: completed
 date: 2026-04-29
 origin: docs/brainstorms/2026-04-29-feed-ingestion-32beatwriters-requirements.md
 deepened: 2026-04-29
