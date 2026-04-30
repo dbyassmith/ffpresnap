@@ -971,9 +971,26 @@ class Database:
             if len(non_ourlads) > 1:
                 continue
             sorted_group = sorted(group, key=keeper_sort_key)
-            keeper_pid = sorted_group[0]["player_id"]
+            keeper = sorted_group[0]
+            keeper_pid = keeper["player_id"]
+            # Pull keeper's full row so we can upgrade fields with better
+            # values from losers before deleting them.
+            keeper_row = self.conn.execute(
+                "SELECT * FROM players WHERE player_id = ?", (keeper_pid,)
+            ).fetchone()
+            best_name = keeper_row["full_name"] or ""
+            best_dc_pos = keeper_row["depth_chart_position"]
+            best_dc_order = (
+                keeper_row["depth_chart_order"]
+                if keeper_row["depth_chart_order"] is not None
+                else 1_000_000
+            )
+            best_ourlads_id = keeper_row["ourlads_id"]
+            best_dc_observed = keeper_row["depth_chart_last_observed_at"]
+            absorbed_ourlads = False
             for loser in sorted_group[1:]:
                 old_pid = loser["player_id"]
+                # Transfer references first.
                 self.conn.execute(
                     "UPDATE notes SET subject_id = ? "
                     "WHERE subject_type = 'player' AND subject_id = ?",
@@ -988,10 +1005,55 @@ class Database:
                     "UPDATE feed_items SET player_id = ? WHERE player_id = ?",
                     (keeper_pid, old_pid),
                 )
+                # Pull loser's full row so we can pick the better metadata.
+                loser_row = self.conn.execute(
+                    "SELECT * FROM players WHERE player_id = ?", (old_pid,)
+                ).fetchone()
+                if loser_row is not None:
+                    if loser_row["source"] == "ourlads":
+                        absorbed_ourlads = True
+                    # Prefer the longer full_name (preserves Jr/Sr/II/III/IV).
+                    loser_name = loser_row["full_name"] or ""
+                    if len(loser_name) > len(best_name):
+                        best_name = loser_name
+                    # Prefer lower depth_chart_order (1=starter beats 2=backup).
+                    loser_order = (
+                        loser_row["depth_chart_order"]
+                        if loser_row["depth_chart_order"] is not None
+                        else 1_000_000
+                    )
+                    if loser_order < best_dc_order:
+                        best_dc_order = loser_order
+                        best_dc_pos = loser_row["depth_chart_position"]
+                        best_dc_observed = loser_row[
+                            "depth_chart_last_observed_at"
+                        ]
+                    # Inherit ourlads_id if keeper doesn't have one.
+                    if best_ourlads_id is None and loser_row["ourlads_id"]:
+                        best_ourlads_id = loser_row["ourlads_id"]
                 self.conn.execute(
                     "DELETE FROM players WHERE player_id = ?", (old_pid,)
                 )
                 merged += 1
+            # Apply the upgrades to the keeper.
+            new_source = keeper_row["source"]
+            if absorbed_ourlads and new_source == "sleeper":
+                new_source = "merged"
+            self.conn.execute(
+                "UPDATE players SET full_name = ?, depth_chart_position = ?, "
+                "depth_chart_order = ?, ourlads_id = ?, "
+                "depth_chart_last_observed_at = ?, source = ? "
+                "WHERE player_id = ?",
+                (
+                    best_name,
+                    best_dc_pos,
+                    best_dc_order if best_dc_order != 1_000_000 else None,
+                    best_ourlads_id,
+                    best_dc_observed,
+                    new_source,
+                    keeper_pid,
+                ),
+            )
         return merged
 
     def _upsert_ourlads_rows(
