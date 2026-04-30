@@ -63,18 +63,18 @@ def synced_db(db, monkeypatch):
         ),
     }
     monkeypatch.setattr(sleeper_module, "fetch_players", lambda url: payload)
-    handle_tool_call(db, "sync_players", {})
+    handle_tool_call(db, "sync", {"source": "sleeper"})
     return db
 
 
 # --- sync / last_sync ---
 
 
-def test_sync_players_writes_and_records(db, monkeypatch):
+def test_sync_writes_and_records(db, monkeypatch):
     monkeypatch.setattr(
         sleeper_module, "fetch_players", lambda url: {"1": _sleeper_player("1")}
     )
-    summary = handle_tool_call(db, "sync_players", {})
+    summary = handle_tool_call(db, "sync", {"source": "sleeper"})
     assert summary["status"] == "success"
     assert summary["players_written"] == 1
     last = handle_tool_call(db, "last_sync", {})
@@ -83,6 +83,90 @@ def test_sync_players_writes_and_records(db, monkeypatch):
 
 def test_last_sync_none_initially(db):
     assert handle_tool_call(db, "last_sync", {}) is None
+
+
+def test_sync_explicit_sleeper_source(db, monkeypatch):
+    monkeypatch.setattr(
+        sleeper_module, "fetch_players", lambda url: {"1": _sleeper_player("1")}
+    )
+    summary = handle_tool_call(db, "sync", {"source": "sleeper"})
+    assert summary["status"] == "success"
+    assert summary["source"] == "sleeper"
+
+
+def test_sync_ourlads_source_runs_in_background(db, monkeypatch):
+    """Ourlads sync starts a background thread and returns a run_id. With
+    fixture-backed fetcher, the run completes successfully in <2s."""
+    from pathlib import Path
+
+    from ffpresnap import ourlads as ourlads_module
+
+    fixtures = Path(__file__).parent / "fixtures" / "ourlads"
+    roster_html = (fixtures / "roster_ATL.html").read_bytes()
+    chart_html = (fixtures / "all_chart.html").read_bytes()
+
+    def fake_fetch(url: str) -> bytes:
+        if url == ourlads_module.OURLADS_ALL_CHART_URL:
+            return chart_html
+        return roster_html
+
+    monkeypatch.setattr(ourlads_module, "_default_fetch", fake_fetch)
+    monkeypatch.setattr(ourlads_module, "DEFAULT_DELAY_SECONDS", 0.0)
+
+    summary = handle_tool_call(db, "sync", {"source": "ourlads"})
+    assert summary["source"] == "ourlads"
+    # Status may be 'running' or 'success' depending on timing.
+    assert summary["status"] in ("running", "success")
+    run_id = summary["run_id"]
+    assert run_id > 0
+
+    # Wait up to 5s for the worker thread to finish.
+    import time
+    deadline = time.monotonic() + 5.0
+    final = None
+    while time.monotonic() < deadline:
+        final = handle_tool_call(db, "get_sync_status", {"run_id": run_id})
+        if final and final["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert final is not None
+    assert final["status"] == "success"
+    assert (final["players_written"] or 0) > 0
+
+
+def test_get_sync_status_returns_none_for_unknown_run(db):
+    assert handle_tool_call(db, "get_sync_status", {"run_id": 999999}) is None
+
+
+def test_last_sync_filters_by_source_via_mcp(db, monkeypatch):
+    monkeypatch.setattr(
+        sleeper_module, "fetch_players", lambda url: {"1": _sleeper_player("1")}
+    )
+    handle_tool_call(db, "sync", {"source": "sleeper"})
+    sleeper_run = handle_tool_call(db, "last_sync", {"source": "sleeper"})
+    assert sleeper_run is not None
+    assert sleeper_run["source"] == "sleeper"
+    # Without filter, returns the same row.
+    assert handle_tool_call(db, "last_sync", {})["id"] == sleeper_run["id"]
+
+
+def test_concurrent_sync_raises_tool_error(db, monkeypatch):
+    """Running an Ourlads sync while a Sleeper sync is already in flight
+    should surface ConcurrentSyncError as a ToolError. Construct this state
+    by inserting a 'running' row directly."""
+    db.conn.execute(
+        "INSERT INTO sync_runs (started_at, source_url, status, source) "
+        "VALUES (?, 'https://ongoing', 'running', 'sleeper')",
+        (
+            __import__("datetime")
+            .datetime.now(__import__("datetime").timezone.utc)
+            .isoformat(timespec="seconds"),
+        ),
+    )
+    db.conn.commit()
+    with pytest.raises(ToolError) as exc:
+        handle_tool_call(db, "sync", {"source": "ourlads"})
+    assert "already running" in str(exc.value)
 
 
 # --- teams ---

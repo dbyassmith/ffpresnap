@@ -2,7 +2,7 @@
 
 Your personal NFL fantasy-football scratchpad — wired into Claude.
 
-ffpresnap is a small local app that mirrors NFL roster and depth-chart data from the [Sleeper API](https://docs.sleeper.com/) into a SQLite file on your machine and exposes it to Claude (Desktop, Code, or Cowork) as an MCP server. Once it's running, you can ask Claude things like:
+ffpresnap is a small local app that mirrors NFL roster and depth-chart data from the [Sleeper API](https://docs.sleeper.com/) into a SQLite file on your machine, with an optional second sync from [ourlads.com](https://www.ourlads.com/nfldepthcharts/) for hand-curated depth charts that often beat Sleeper to lineup changes. It exposes everything to Claude (Desktop, Code, or Cowork) as an MCP server. Once it's running, you can ask Claude things like:
 
 > *"Show me the Chiefs depth chart."*
 > *"Add a note to Patrick Mahomes: ankle is wrapped on the practice report — watch it."*
@@ -49,25 +49,34 @@ pip install -e .
 This installs two console scripts inside the venv:
 
 - **`ffpresnap-mcp`** — the MCP server Claude talks to.
-- **`ffpresnap-sync`** — pulls the latest NFL player data from Sleeper into your local DB.
+- **`ffpresnap-sync`** — pulls the latest NFL player data (Sleeper, Ourlads) and beat-reporter feeds (32beatwriters) into your local DB.
 
 > **Tip:** running `which ffpresnap-mcp` (macOS/Linux) or `where ffpresnap-mcp` (Windows) prints the absolute path. Some Claude clients prefer the absolute path in their config — see the next step.
 
 ### 3. Pull the initial player data
 
 ```bash
-ffpresnap-sync
+ffpresnap-sync                            # default source: sleeper
+ffpresnap-sync --source=ourlads           # optional: layer Ourlads depth charts on top
+ffpresnap-sync --source=32beatwriters     # optional: pull beat-reporter nuggets as auto-notes
+ffpresnap-sync --source=32beatwriters --full   # backfill the entire feed (first-run or reconcile)
 ```
 
-You should see something like `synced 4231 players in 0.4s (run_id=1)`. This filters to fantasy-relevant positions (QB, RB, WR, TE, K, DEF) and writes them to `~/.ffpresnap/notes.db`.
+You should see something like `synced 4231 players in 0.4s (run_id=1, source=sleeper)`. The Sleeper sync filters to fantasy-relevant positions (QB, RB, WR, TE, K, DEF) and writes them to `~/.ffpresnap/notes.db`.
 
-You can rerun this whenever you want fresh roster/injury data. Sleeper recommends no more than once per day; a daily cron is a reasonable default:
+The optional **Ourlads** sync layers hand-curated, beat-reporter-driven depth charts on top of Sleeper's data. It fetches 32 team rosters plus one all-teams depth-chart page from [ourlads.com](https://www.ourlads.com/nfldepthcharts/) (~1-3 minutes total at the polite 1.5s/request default) and merges them into the same `players` table — without disturbing your Sleeper-sourced notes. Players Ourlads tracks but Sleeper hasn't picked up yet (practice-squad call-ups, recent signings) become first-class entries you can attach notes to.
+
+The optional **32beatwriters** feed sync pulls paginated beat-reporter "nuggets" from [api.32beatwriters.com](https://api.32beatwriters.com/) and turns each one into a searchable note on the matched player — same `notes` shape as anything you'd write yourself, just with a source/author/url footer at the bottom. Items about players Sleeper doesn't carry (rookies, prospects) are stored unmatched and back-attached automatically the next time their player appears. The default incremental walk is bounded; use `--full` for first-run backfill. Adding more feed sources later is one new adapter file (see `src/ffpresnap/feeds/`).
+
+You can rerun any source whenever you want fresh data. A reasonable daily cron does all three in order:
 
 ```cron
-0 9 * * * /absolute/path/to/.venv/bin/ffpresnap-sync
+0 9 * * * /absolute/path/to/.venv/bin/ffpresnap-sync --source=sleeper && /absolute/path/to/.venv/bin/ffpresnap-sync --source=ourlads && /absolute/path/to/.venv/bin/ffpresnap-sync --source=32beatwriters
 ```
 
-You can also ask Claude to run `sync_players` from inside a chat once the MCP is connected.
+(Per-field ownership means Ourlads owns `depth_chart_position` / `_order` once it has touched a row, so cron ordering doesn't actually matter for player-data sources — but Sleeper-then-Ourlads-then-feeds is the most intuitive sequence.)
+
+You can also ask Claude to run `sync(source=...)` from inside a chat once the MCP is connected. Sleeper sync returns a summary inline (~5s); Ourlads and feed syncs run in a background thread and return a `run_id` immediately — Claude polls `get_sync_status(run_id)` to track completion.
 
 ### 4. Connect to Claude
 
@@ -115,7 +124,7 @@ In Claude, ask:
 
 > *"What ffpresnap tools do you have?"*
 
-You should see 19 tools listed (`sync_players`, `list_teams`, `get_depth_chart`, `add_note`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
+You should see 24 tools listed (`sync`, `get_sync_status`, `list_teams`, `get_depth_chart`, `add_note`, `list_feed_items`, `list_prompts`, etc.). If nothing appears, the client didn't pick up the MCP — re-check the config path and restart fully.
 
 ---
 
@@ -128,9 +137,18 @@ Build me a Claude artifact that displays the ffpresnap prompt library.
 
 Step 1. Call the MCP tool `list_prompts` (no arguments).
 
-Step 2. Embed the JSON result directly into the artifact source as a JavaScript constant — the artifact is a snapshot, not a live fetch. To refresh it later, ask Claude to regenerate the artifact.
+Step 2. Embed the JSON result directly into the artifact source as a JavaScript constant — the artifact is a snapshot, not a live fetch.
 
 Step 3. Render the prompts as a responsive card grid. Each card shows the prompt's `title` as the heading, the `description` as a one-line subhead, and a "Copy prompt" button that calls `navigator.clipboard.writeText(prompt.body)` and briefly shows "Copied!" in place of the button label.
+
+Step 4. Above the grid, render an intro block in this order:
+- A small wordmark / title: "ffpresnap".
+- A short paragraph (max ~640px wide): *"ffpresnap is an un-opinionated scratchpad for all of your fantasy football research. Using the MCP, you can ask Claude to build whatever dashboards best suit your needs — the prompts below are just a starting point."*
+- A one-line instruction beneath it in muted text: "Click 'Copy prompt' on any card, paste it into a new chat with the ffpresnap MCP connected, and Claude will build the dashboard."
+
+Step 5. In the top-right of the header, render a refresh icon button (↻). Because the artifact is a snapshot and cannot call MCP tools directly, the refresh button works by copy-to-clipboard: on click, call `navigator.clipboard.writeText("Show me the prompt library")` and briefly flash "Copied! Paste in Claude to pull fresh prompts." next to the button. Aria-label: "Refresh prompts (copies regenerate command)". Below the header in small muted text: *"This is a snapshot. Click ↻ to copy the regenerate command — paste it in Claude to pull the latest prompts."*
+
+Step 6. Visual style: clean cards with subtle borders, generous padding, readable typography. Plain React + inline styles. Mobile-friendly grid (1 column on narrow screens, 2–3 on wider). The refresh button stays aligned to the right of the header on all screen sizes.
 ```
 
 Claude will build an artifact with one card per dashboard prompt:
@@ -142,7 +160,9 @@ Claude will build an artifact with one card per dashboard prompt:
 | **Depth Chart Explorer** | Pick a team, see depth chart grouped by position |
 | **Note Recency Feed** | Chronological feed of every note you've written |
 | **Player Explorer** | Search or browse a team's depth chart, drill into a player, compose notes |
+| **Team Explorer** | Drill from all NFL teams into one team's depth chart and notes, then into a single player |
 | **Team Overview** | Combined depth chart + team notes + mentions |
+| **Watchlist** | Browse watchlisted players, drill into details, copy add/remove commands |
 | **Mention Graph** | Node-link graph of who-mentions-whom across notes |
 
 Click **Copy prompt** on any card, open a new Claude chat, paste, and Claude will build that dashboard for you using your local data.

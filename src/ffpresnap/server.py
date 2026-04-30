@@ -3,11 +3,35 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
+import traceback
 from typing import Any
 
-from .db import AmbiguousTeamError, Database, NotFoundError
+from .db import (
+    AmbiguousTeamError,
+    ConcurrentSyncError,
+    Database,
+    NotFoundError,
+)
+from .feeds import FeedFetchError, adapter_names
 from .sleeper import SleeperFetchError
 from .sync import run_sync
+
+
+def _all_source_names() -> list[str]:
+    """Build the dynamic ``source`` enum for the unified `sync` tool.
+
+    Player-data sources (``sleeper``, ``ourlads``) plus every registered
+    feed adapter. Importing :mod:`ffpresnap.feeds` triggers adapter
+    registration; new feed adapters appear here automatically without any
+    server-side change.
+    """
+    return ["sleeper", "ourlads", *adapter_names()]
+
+
+# Tracks Ourlads sync background threads so they aren't garbage collected
+# mid-run. Thread bodies open their own DB connection via Database.open.
+_BACKGROUND_RUNS: dict[int, threading.Thread] = {}
 
 
 _MENTIONS_SCHEMA: dict[str, Any] = {
@@ -22,17 +46,122 @@ _MENTIONS_SCHEMA: dict[str, Any] = {
 TOOLS: list[dict[str, Any]] = [
     # --- sync ---
     {
-        "name": "sync_players",
+        "name": "sync",
         "description": (
-            "Pull the current NFL player set from Sleeper and replace local data. "
-            "Filters to fantasy positions (QB/RB/WR/TE/K/DEF). Records the run."
+            "Pull data from a source and merge it locally. Response shape depends on `source`:\n"
+            "  • `sleeper` — synchronous (~5s). Returns `{status: 'success', source, run_id, players_written, ...}` directly.\n"
+            "  • `ourlads` — background thread (~1-3 min). Returns `{status: 'running', source, run_id, ...}` immediately; poll `get_sync_status(run_id)` until status is 'success' or 'error'.\n"
+            "  • any feed source (e.g. `32beatwriters`) — background thread, paginated. Returns `{status: 'running', source, run_id, ...}` immediately; poll `get_sync_status(run_id)` for the final `items_fetched/new/matched/unmatched` counters.\n"
+            "Feed sources also accept `full=true` to backfill the entire feed instead of stopping at the first fully-seen page. Records every run in `sync_runs`."
         ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": _all_source_names(),
+                },
+                "full": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Feed sources only: walk the entire feed instead of "
+                        "stopping at the first fully-seen page. Use for first-"
+                        "run backfill or reconciliation."
+                    ),
+                },
+            },
+            "required": ["source"],
+        },
     },
     {
         "name": "last_sync",
-        "description": "Return the most recent sync run, or null if none has run yet.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "Return the most recent sync run, or null if none has run yet. "
+            "Optional `source` restricts to runs of that source."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": _all_source_names(),
+                },
+            },
+        },
+    },
+    {
+        "name": "get_sync_status",
+        "description": (
+            "Return the sync_runs row for a given `run_id` (or null if not "
+            "found). Use after starting a background sync via `sync` to poll "
+            "for completion. The row's `status` field becomes 'success' or "
+            "'error' once the background run finishes. Feed-sync rows include "
+            "`items_fetched`, `items_new`, `items_matched`, `items_unmatched`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "integer"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    # --- feeds (read + maintenance) ---
+    {
+        "name": "list_feed_items",
+        "description": (
+            "List raw items pulled from feed adapters. Filters AND-combine. "
+            "`player_id` restricts to items attached to that player. `source` "
+            "restricts to items from a single feed (e.g. '32beatwriters'). "
+            "`since` is an ISO timestamp lower bound on `created_at`. "
+            "`matched=true` returns only items already linked to a player; "
+            "`matched=false` returns only unmatched items (rookies/prospects "
+            "awaiting back-match). `limit` defaults to 50."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "player_id": {"type": "string"},
+                "source": {"type": "string"},
+                "since": {"type": "string"},
+                "matched": {"type": "boolean"},
+                "limit": {"type": "integer", "default": 50},
+            },
+        },
+    },
+    {
+        "name": "rematch_feed_items",
+        "description": (
+            "Retry identity matching for unmatched feed items ingested in the "
+            "last `window_days` days (default 30). Useful after a Sleeper or "
+            "Ourlads sync brings in players that were previously unknown — "
+            "the same pass runs at the tail of every sync, but you can also "
+            "trigger it manually. Returns `{checked, matched, notes_written}`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window_days": {"type": "integer", "default": 30},
+            },
+        },
+    },
+    {
+        "name": "delete_auto_notes_from_run",
+        "description": (
+            "Bulk-rollback for a misfiring feed sync. Deletes every auto-note "
+            "whose backing `feed_items` row was first-attached during the "
+            "given sync run. Leaves the raw `feed_items` rows alive (their "
+            "`note_id` becomes NULL). Idempotent. Non-feed run IDs are "
+            "no-ops. Returns `{deleted_notes: N}`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "integer"},
+            },
+            "required": ["run_id"],
+        },
     },
     # --- browse ---
     {
@@ -343,14 +472,124 @@ def _list_notes_dispatch(
     raise ToolError(f"Unknown scope: {scope!r}")
 
 
+def _start_background_sync(
+    db: Database, *, source: str, full: bool = False
+) -> dict[str, Any]:
+    """Start a long-running sync in a daemon thread. Returns a run summary
+    immediately containing the run_id — poll get_sync_status to track
+    completion. The thread opens its own Database connection (sqlite3
+    connections are not safe to share across threads by default).
+
+    Used for ourlads (~1-3 min) and feed sources (variable; bounded by
+    MAX_PAGES_INCREMENTAL × DELAY_SECONDS). Sleeper sync stays synchronous
+    in the request thread.
+
+    The advisory concurrency lock is acquired in the worker via
+    record_sync_start; this function does a foreground pre-check so the
+    caller sees a clean ToolError instead of polling a brief 'running'
+    that immediately flips to 'error'.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=5)
+    ).isoformat(timespec="seconds")
+    existing = db.conn.execute(
+        "SELECT id, source FROM sync_runs WHERE status = 'running' "
+        "AND started_at > ?",
+        (cutoff,),
+    ).fetchone()
+    if existing is not None:
+        raise ConcurrentSyncError(
+            f"Another sync ({existing['source']}, run_id={existing['id']}) "
+            "is already running. Wait for it to finish or fail."
+        )
+    if db.path is None:
+        raise RuntimeError(
+            f"Cannot start a background {source} sync: Database has no path. "
+            "Open the Database via Database.open(...) so the worker thread "
+            "can attach its own connection."
+        )
+
+    db_path = str(db.path)
+    pre_run = db.last_sync(source=source)
+    pre_id = pre_run["id"] if pre_run else 0
+
+    def worker(path: str) -> None:
+        bg = Database.open(path)
+        try:
+            try:
+                run_sync(bg, source=source, full=full)
+            except Exception:
+                # run_sync records the sync_runs failure on its own; print the
+                # traceback to stderr for operator visibility.
+                traceback.print_exc()
+        finally:
+            bg.close()
+
+    thread = threading.Thread(target=worker, args=(db_path,), daemon=True)
+    thread.start()
+
+    # Wait briefly for the worker's record_sync_start to land. We're done as
+    # soon as we observe a new run_id for this source.
+    import time
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        latest = db.last_sync(source=source)
+        if latest is not None and latest["id"] > pre_id:
+            _BACKGROUND_RUNS[latest["id"]] = thread
+            return {
+                "run_id": latest["id"],
+                "status": latest["status"],
+                "source": source,
+                "started_at": latest["started_at"],
+                "finished_at": latest.get("finished_at"),
+                "error": latest.get("error"),
+            }
+        time.sleep(0.05)
+    raise ToolError(
+        f"{source} sync background thread failed to start within 2s; "
+        "check stderr for traceback."
+    )
+
+
 def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
     """Pure dispatch over tool name. Raises ToolError on user-facing failures."""
     args = args or {}
     try:
-        if name == "sync_players":
-            return run_sync(db)
+        if name == "sync":
+            source = args.get("source")
+            if not source:
+                raise ToolError("Missing required argument: source")
+            full = bool(args.get("full", False))
+            if source == "sleeper":
+                return run_sync(db, source=source)
+            if source == "ourlads" or source in adapter_names():
+                return _start_background_sync(db, source=source, full=full)
+            raise ToolError(f"Unknown sync source: {source!r}")
         if name == "last_sync":
-            return db.last_sync()
+            return db.last_sync(source=args.get("source"))
+        if name == "get_sync_status":
+            return db.get_sync_run(int(args["run_id"]))
+        if name == "list_feed_items":
+            return db.list_feed_items(
+                player_id=args.get("player_id"),
+                source=args.get("source"),
+                since=args.get("since"),
+                matched=args.get("matched"),
+                limit=int(args.get("limit", 50)),
+            )
+        if name == "rematch_feed_items":
+            from .sync import build_feed_note_body
+
+            return db.rematch_recent_unmatched_feed_items(
+                window_days=int(args.get("window_days", 30)),
+                note_body_for=build_feed_note_body,
+            )
+        if name == "delete_auto_notes_from_run":
+            deleted = db.delete_auto_notes_from_run(int(args["run_id"]))
+            return {"deleted_notes": deleted}
         if name == "list_teams":
             return db.list_teams(args.get("query"))
         if name == "get_team":
@@ -442,6 +681,10 @@ def handle_tool_call(db: Database, name: str, args: dict[str, Any]) -> Any:
         raise ToolError(str(e)) from e
     except SleeperFetchError as e:
         raise ToolError(f"Sleeper sync failed: {e}") from e
+    except FeedFetchError as e:
+        raise ToolError(f"Feed sync failed: {e}") from e
+    except ConcurrentSyncError as e:
+        raise ToolError(str(e)) from e
     except KeyError as e:
         raise ToolError(f"Missing required argument: {e.args[0]}") from e
 

@@ -182,6 +182,149 @@ def test_v5_db_migrates_to_v6_adds_watchlist_column(tmp_path):
         db.close()
 
 
+def test_v6_db_migrates_to_v7_adds_source_columns(tmp_path):
+    """Opening a v6 DB upgrades to v7 by adding `source`, `ourlads_id`,
+    `depth_chart_last_observed_at` to players and `source` to sync_runs.
+    Existing rows backfill to source='sleeper'; nullable columns stay NULL.
+    """
+    db_path = tmp_path / "v6.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '6');
+        CREATE TABLE players (
+          player_id TEXT PRIMARY KEY,
+          full_name TEXT,
+          team TEXT,
+          position TEXT,
+          updated_at TEXT NOT NULL,
+          watchlist INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO players (player_id, full_name, team, position, updated_at)
+          VALUES ('99', 'Holdover', 'KC', 'QB', '2026-04-01T00:00:00+00:00');
+        CREATE TABLE sync_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          players_written INTEGER,
+          source_url TEXT NOT NULL,
+          status TEXT NOT NULL,
+          error TEXT
+        );
+        INSERT INTO sync_runs (started_at, source_url, status)
+          VALUES ('2026-04-01T00:00:00+00:00', 'https://example.com', 'success');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database.open(db_path)
+    try:
+        version = db.conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert int(version["value"]) == SCHEMA_VERSION
+
+        player_cols = {
+            c["name"] for c in db.conn.execute("PRAGMA table_info(players)").fetchall()
+        }
+        assert "source" in player_cols
+        assert "ourlads_id" in player_cols
+        assert "depth_chart_last_observed_at" in player_cols
+
+        sync_cols = {
+            c["name"]
+            for c in db.conn.execute("PRAGMA table_info(sync_runs)").fetchall()
+        }
+        assert "source" in sync_cols
+
+        player_row = db.conn.execute(
+            "SELECT source, ourlads_id, depth_chart_last_observed_at "
+            "FROM players WHERE player_id = '99'"
+        ).fetchone()
+        assert player_row["source"] == "sleeper"
+        assert player_row["ourlads_id"] is None
+        assert player_row["depth_chart_last_observed_at"] is None
+
+        sync_row = db.conn.execute(
+            "SELECT source FROM sync_runs WHERE source_url = 'https://example.com'"
+        ).fetchone()
+        assert sync_row["source"] == "sleeper"
+    finally:
+        db.close()
+
+
+def test_v7_db_idempotent_reopen(tmp_path):
+    """Reopening an already-v7 DB does not error and does not re-add columns."""
+    db_path = tmp_path / "v7.db"
+    db = Database.open(db_path)
+    try:
+        # Capture initial column counts.
+        before_players = db.conn.execute("PRAGMA table_info(players)").fetchall()
+        before_sync = db.conn.execute("PRAGMA table_info(sync_runs)").fetchall()
+    finally:
+        db.close()
+
+    # Reopen and confirm nothing changed.
+    db = Database.open(db_path)
+    try:
+        after_players = db.conn.execute("PRAGMA table_info(players)").fetchall()
+        after_sync = db.conn.execute("PRAGMA table_info(sync_runs)").fetchall()
+        assert len(after_players) == len(before_players)
+        assert len(after_sync) == len(before_sync)
+    finally:
+        db.close()
+
+
+def test_v6_to_v7_partial_prior_state_backfills_null_source(tmp_path):
+    """Defends against a partial prior migration that left NULL `source` values:
+    the v6→v7 arm runs `UPDATE players SET source='sleeper' WHERE source IS NULL`
+    unconditionally so the post-migration table is NULL-free.
+    """
+    db_path = tmp_path / "v6_partial.db"
+    conn = sqlite3.connect(str(db_path))
+    # Simulate a prior aborted migration: column exists but was added without a
+    # default, leaving an existing row with NULL source.
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '6');
+        CREATE TABLE players (
+          player_id TEXT PRIMARY KEY,
+          full_name TEXT,
+          team TEXT,
+          position TEXT,
+          updated_at TEXT NOT NULL,
+          watchlist INTEGER NOT NULL DEFAULT 0,
+          source TEXT
+        );
+        INSERT INTO players (player_id, full_name, team, position, updated_at, source)
+          VALUES ('99', 'Half-Migrated', 'KC', 'QB', '2026-04-01T00:00:00+00:00', NULL);
+        CREATE TABLE sync_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          players_written INTEGER,
+          source_url TEXT NOT NULL,
+          status TEXT NOT NULL,
+          error TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database.open(db_path)
+    try:
+        row = db.conn.execute(
+            "SELECT source FROM players WHERE player_id = '99'"
+        ).fetchone()
+        assert row["source"] == "sleeper"
+    finally:
+        db.close()
+
+
 def test_v4_db_migrates_to_v5_preserving_data(tmp_path):
     """A v4 DB should upgrade to v5 in place: existing data untouched, the new
     `prompts` table exists, and schema_version becomes 5.
