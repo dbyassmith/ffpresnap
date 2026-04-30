@@ -22,18 +22,33 @@ def test_normalize_lowercases():
     assert normalize_full_name("PATRICK MAHOMES") == "patrick mahomes"
 
 
-def test_normalize_preserves_suffix():
-    """Suffixes are intentionally NOT stripped — namesakes must disambiguate."""
-    assert normalize_full_name("Marvin Harrison Jr.") == "marvin harrison jr"
-    assert normalize_full_name("Steve Smith Sr") == "steve smith sr"
-    assert normalize_full_name("Kenneth Walker III") == "kenneth walker iii"
+def test_normalize_strips_generational_suffix():
+    """Sources disagree about Jr/Sr/II/III/IV (Sleeper often includes,
+    Ourlads / 32beatwriters often don't). Stripping ensures they
+    identity-match. Genuine same-team namesakes are extremely rare;
+    `find_player_for_match` returns the >1 case as ambiguous and the
+    caller skips the merge.
+    """
+    assert normalize_full_name("Marvin Harrison Jr.") == "marvin harrison"
+    assert normalize_full_name("Marvin Harrison") == "marvin harrison"
+    assert normalize_full_name("Steve Smith Sr") == "steve smith"
+    assert normalize_full_name("Kenneth Walker III") == "kenneth walker"
+    assert normalize_full_name("Odell Beckham II") == "odell beckham"
+    assert normalize_full_name("Cam Ward IV") == "cam ward"
 
 
-def test_normalize_distinguishes_suffix_from_no_suffix():
-    """Father/son disambiguation — the whole point of preserving suffixes."""
-    assert normalize_full_name("Marvin Harrison") != normalize_full_name(
-        "Marvin Harrison Jr."
-    )
+def test_normalize_suffix_strip_is_idempotent():
+    once = normalize_full_name("Marvin Harrison Jr.")
+    twice = normalize_full_name(once)
+    assert once == twice == "marvin harrison"
+
+
+def test_normalize_does_not_strip_when_only_suffix_token_remains():
+    """Avoid eating standalone 'Sr' / 'Jr' that would otherwise leave an
+    empty string. Single-token input is preserved as-is.
+    """
+    assert normalize_full_name("Sr") == "sr"
+    assert normalize_full_name("Jr") == "jr"
 
 
 def test_normalize_empty_input():

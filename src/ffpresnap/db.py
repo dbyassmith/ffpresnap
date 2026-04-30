@@ -12,7 +12,7 @@ from ._naming import normalize_full_name, synthesize_ourlads_id
 from .teams import TEAMS
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class NotFoundError(Exception):
@@ -159,8 +159,46 @@ CREATE TABLE IF NOT EXISTS sync_runs (
   source_url TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT,
-  source TEXT NOT NULL DEFAULT 'sleeper'
+  source TEXT NOT NULL DEFAULT 'sleeper',
+  items_fetched INTEGER,
+  items_new INTEGER,
+  items_matched INTEGER,
+  items_unmatched INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS feed_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  source_url TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feed_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id INTEGER NOT NULL REFERENCES feed_sources(id) ON DELETE CASCADE,
+  external_id TEXT NOT NULL,
+  external_player_id TEXT,
+  external_player_name TEXT NOT NULL,
+  external_team TEXT,
+  external_position TEXT,
+  team_abbr TEXT,
+  source_url TEXT,
+  source_author TEXT,
+  raw_html TEXT,
+  cleaned_text TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  ingested_at TEXT NOT NULL,
+  player_id TEXT REFERENCES players(player_id) ON DELETE SET NULL,
+  note_id INTEGER REFERENCES notes(id) ON DELETE SET NULL,
+  note_run_id INTEGER,
+  UNIQUE(source_id, external_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feed_items_player ON feed_items(player_id);
+CREATE INDEX IF NOT EXISTS idx_feed_items_source_created
+  ON feed_items(source_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_feed_items_unmatched
+  ON feed_items(ingested_at)
+  WHERE player_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS prompts (
   slug TEXT PRIMARY KEY,
@@ -219,7 +257,7 @@ def _study_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _sync_run_row(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    out = {
         "id": row["id"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
@@ -228,6 +266,35 @@ def _sync_run_row(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "error": row["error"],
         "source": row["source"],
+    }
+    # Feed-sync counter columns (NULL on player-data syncs).
+    for col in ("items_fetched", "items_new", "items_matched", "items_unmatched"):
+        try:
+            out[col] = row[col]
+        except (IndexError, KeyError):
+            out[col] = None
+    return out
+
+
+def _feed_item_row(row: sqlite3.Row, *, source_name: str | None = None) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "source_id": row["source_id"],
+        "source_name": source_name,
+        "external_id": row["external_id"],
+        "external_player_id": row["external_player_id"],
+        "external_player_name": row["external_player_name"],
+        "external_team": row["external_team"],
+        "external_position": row["external_position"],
+        "team_abbr": row["team_abbr"],
+        "source_url": row["source_url"],
+        "source_author": row["source_author"],
+        "cleaned_text": row["cleaned_text"],
+        "created_at": row["created_at"],
+        "ingested_at": row["ingested_at"],
+        "player_id": row["player_id"],
+        "note_id": row["note_id"],
+        "note_run_id": row["note_run_id"],
     }
 
 
@@ -242,6 +309,7 @@ class Database:
         self._migrate()
         self._seed_teams()
         self._seed_prompts()
+        self._seed_feed_sources()
 
     @classmethod
     def open(cls, path: str | Path | None = None) -> "Database":
@@ -364,6 +432,26 @@ class Database:
                 "UPDATE sync_runs SET source = 'sleeper' WHERE source IS NULL"
             )
 
+        # v7 -> v8: add feed_sources + feed_items tables (created by the
+        # SCHEMA_V2 executescript at the bottom of _migrate) plus four
+        # nullable feed counter columns on sync_runs. Each column ALTER is
+        # PRAGMA-guarded so partial-prior-application is idempotent.
+        if current >= 7 and current < 8:
+            sync_cols = self.conn.execute(
+                "PRAGMA table_info(sync_runs)"
+            ).fetchall()
+            sync_names = {c["name"] for c in sync_cols}
+            for col in (
+                "items_fetched",
+                "items_new",
+                "items_matched",
+                "items_unmatched",
+            ):
+                if sync_cols and col not in sync_names:
+                    self.conn.execute(
+                        f"ALTER TABLE sync_runs ADD COLUMN {col} INTEGER"
+                    )
+
         # v4 -> v5 is purely additive (the `prompts` table). The
         # executescript(SCHEMA_V2) call below creates it; this arm exists for
         # symmetry and to make schema-version progression observable in tests.
@@ -403,6 +491,28 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(version),),
         )
+
+    def _seed_feed_sources(self) -> None:
+        """Seed the feed_sources catalog from the live adapter registry.
+
+        Importing :mod:`ffpresnap.feeds` triggers adapter registration, so by
+        the time this runs every concrete adapter has a (name, source_url)
+        pair available. Tests that register fake adapters before opening a
+        DB get them seeded automatically.
+        """
+        # Imported here to avoid a top-of-module circular import (feeds
+        # imports nothing from db, but db is loaded earlier in __init__).
+        from .feeds._registry import _REGISTRY
+
+        sources = tuple((a.name, a.source_url) for a in _REGISTRY.values())
+        if not sources:
+            return
+        self.conn.executemany(
+            "INSERT INTO feed_sources (name, source_url) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET source_url = excluded.source_url",
+            sources,
+        )
+        self.conn.commit()
 
     def _seed_teams(self) -> None:
         self.conn.executemany(
@@ -679,8 +789,12 @@ class Database:
                     ourlads_row["depth_chart_last_observed_at"],
                 ),
             )
-            # Move notes (polymorphic, no FK) and mentions (FK with cascade)
-            # to point at the new player_id.
+            # Move notes (polymorphic, no FK), mentions (FK with cascade),
+            # and any feed_items bound to the merged-away pid — all to
+            # point at the new player_id. The feed_items rewrite is
+            # load-bearing: without it, the FK ON DELETE SET NULL on
+            # feed_items.player_id silently drops the back-match the
+            # moment a player gets merged.
             self.conn.execute(
                 "UPDATE notes SET subject_id = ? "
                 "WHERE subject_type = 'player' AND subject_id = ?",
@@ -688,6 +802,10 @@ class Database:
             )
             self.conn.execute(
                 "UPDATE note_player_mentions SET player_id = ? WHERE player_id = ?",
+                (pid, old_pid),
+            )
+            self.conn.execute(
+                "UPDATE feed_items SET player_id = ? WHERE player_id = ?",
                 (pid, old_pid),
             )
             # Now safe to delete the Ourlads-only row.
@@ -764,6 +882,15 @@ class Database:
                 "DELETE FROM players WHERE source = 'sleeper'"
             )
 
+        # Suffix-variant cleanup: collapse Ourlads-only rows whose
+        # normalized name (with suffix-strip) now matches an existing
+        # Sleeper or merged row on the same team+position. This catches
+        # historical duplicates created when sources disagree on whether
+        # to write "Marvin Harrison" vs "Marvin Harrison Jr". Runs after
+        # the per-row UPSERT above so newly-written Sleeper rows are
+        # eligible targets.
+        self._merge_suffix_variant_duplicates()
+
         # Orphan-note cleanup: any player-subject note pointing at a player_id
         # no longer in the table (notes table is polymorphic, no FK cascade).
         self.conn.execute(
@@ -771,6 +898,163 @@ class Database:
             "AND subject_id NOT IN (SELECT player_id FROM players)"
         )
         return len(validated)
+
+    def _merge_suffix_variant_duplicates(self) -> int:
+        """Per-sync sweep that collapses any rows whose normalized name +
+        team + position collide.
+
+        Two failure modes get cleaned up here:
+
+        1. **Cross-source dupes** — the same player appears as a Sleeper
+           (or merged) row AND an Ourlads-only row, because sources
+           disagreed about a Jr/Sr/II/III/IV suffix at the time of
+           identity-merge. The Sleeper / merged row wins (stable pid).
+
+        2. **Intra-Ourlads dupes** — Ourlads occasionally lists the
+           same player twice on its all-teams chart with different name
+           variants (e.g. "Michael Penix Jr." at QB#1 and "Michael
+           Penix" at QB#2). Picks a deterministic keeper and merges
+           the rest into it.
+
+        For each colliding bucket the keeper is chosen by:
+          1. Prefer ``source IN ('sleeper','merged')`` over ``'ourlads'``
+          2. Prefer the row with the lowest ``depth_chart_order`` (1 = starter)
+          3. Tie-break by longest ``full_name`` (more complete metadata)
+          4. Tie-break by lowest ``player_id`` (oldest / most stable)
+
+        Notes, mentions, and feed_items pointing at the loser pids get
+        rewritten to the keeper's pid; the duplicate rows are deleted.
+        Returns the number of rows merged.
+        """
+        rows = self.conn.execute(
+            "SELECT player_id, full_name, team, position, source, "
+            "depth_chart_order FROM players"
+        ).fetchall()
+        if not rows:
+            return 0
+
+        buckets: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        for r in rows:
+            normalized = normalize_full_name(r["full_name"] or "")
+            if not normalized:
+                continue
+            key = (r["team"] or "", r["position"] or "", normalized)
+            buckets.setdefault(key, []).append(r)
+
+        def keeper_sort_key(r: sqlite3.Row) -> tuple[int, int, int, str]:
+            source_pref = 0 if r["source"] in ("sleeper", "merged") else 1
+            order = (
+                r["depth_chart_order"]
+                if r["depth_chart_order"] is not None
+                else 1_000_000
+            )
+            name_len_neg = -len(r["full_name"] or "")
+            return (source_pref, order, name_len_neg, r["player_id"])
+
+        merged = 0
+        for group in buckets.values():
+            if len(group) < 2:
+                continue
+            # Only collapse buckets where at least one row is
+            # Ourlads-sourced — Sleeper IDs are authoritative, never
+            # merge across two distinct stable Sleeper pids even if
+            # they happen to normalize to the same key.
+            if not any(r["source"] == "ourlads" for r in group):
+                continue
+            # Genuine ambiguity guard: if multiple non-Ourlads rows
+            # exist in the same bucket, we cannot safely pick which
+            # Sleeper player the Ourlads-only row(s) belong to. Leave
+            # the bucket alone — the Ourlads rows stay as
+            # ourlads-only, mirroring the existing ambiguous-match
+            # posture of `find_player_for_match`.
+            non_ourlads = [r for r in group if r["source"] != "ourlads"]
+            if len(non_ourlads) > 1:
+                continue
+            sorted_group = sorted(group, key=keeper_sort_key)
+            keeper = sorted_group[0]
+            keeper_pid = keeper["player_id"]
+            # Pull keeper's full row so we can upgrade fields with better
+            # values from losers before deleting them.
+            keeper_row = self.conn.execute(
+                "SELECT * FROM players WHERE player_id = ?", (keeper_pid,)
+            ).fetchone()
+            best_name = keeper_row["full_name"] or ""
+            best_dc_pos = keeper_row["depth_chart_position"]
+            best_dc_order = (
+                keeper_row["depth_chart_order"]
+                if keeper_row["depth_chart_order"] is not None
+                else 1_000_000
+            )
+            best_ourlads_id = keeper_row["ourlads_id"]
+            best_dc_observed = keeper_row["depth_chart_last_observed_at"]
+            absorbed_ourlads = False
+            for loser in sorted_group[1:]:
+                old_pid = loser["player_id"]
+                # Transfer references first.
+                self.conn.execute(
+                    "UPDATE notes SET subject_id = ? "
+                    "WHERE subject_type = 'player' AND subject_id = ?",
+                    (keeper_pid, old_pid),
+                )
+                self.conn.execute(
+                    "UPDATE note_player_mentions SET player_id = ? "
+                    "WHERE player_id = ?",
+                    (keeper_pid, old_pid),
+                )
+                self.conn.execute(
+                    "UPDATE feed_items SET player_id = ? WHERE player_id = ?",
+                    (keeper_pid, old_pid),
+                )
+                # Pull loser's full row so we can pick the better metadata.
+                loser_row = self.conn.execute(
+                    "SELECT * FROM players WHERE player_id = ?", (old_pid,)
+                ).fetchone()
+                if loser_row is not None:
+                    if loser_row["source"] == "ourlads":
+                        absorbed_ourlads = True
+                    # Prefer the longer full_name (preserves Jr/Sr/II/III/IV).
+                    loser_name = loser_row["full_name"] or ""
+                    if len(loser_name) > len(best_name):
+                        best_name = loser_name
+                    # Prefer lower depth_chart_order (1=starter beats 2=backup).
+                    loser_order = (
+                        loser_row["depth_chart_order"]
+                        if loser_row["depth_chart_order"] is not None
+                        else 1_000_000
+                    )
+                    if loser_order < best_dc_order:
+                        best_dc_order = loser_order
+                        best_dc_pos = loser_row["depth_chart_position"]
+                        best_dc_observed = loser_row[
+                            "depth_chart_last_observed_at"
+                        ]
+                    # Inherit ourlads_id if keeper doesn't have one.
+                    if best_ourlads_id is None and loser_row["ourlads_id"]:
+                        best_ourlads_id = loser_row["ourlads_id"]
+                self.conn.execute(
+                    "DELETE FROM players WHERE player_id = ?", (old_pid,)
+                )
+                merged += 1
+            # Apply the upgrades to the keeper.
+            new_source = keeper_row["source"]
+            if absorbed_ourlads and new_source == "sleeper":
+                new_source = "merged"
+            self.conn.execute(
+                "UPDATE players SET full_name = ?, depth_chart_position = ?, "
+                "depth_chart_order = ?, ourlads_id = ?, "
+                "depth_chart_last_observed_at = ?, source = ? "
+                "WHERE player_id = ?",
+                (
+                    best_name,
+                    best_dc_pos,
+                    best_dc_order if best_dc_order != 1_000_000 else None,
+                    best_ourlads_id,
+                    best_dc_observed,
+                    new_source,
+                    keeper_pid,
+                ),
+            )
+        return merged
 
     def _upsert_ourlads_rows(
         self,
@@ -916,6 +1200,13 @@ class Database:
                     "OR depth_chart_last_observed_at < ?)",
                     (team_abbr, run_start_at),
                 )
+
+        # Tail-of-sync dupe collapse — handles the intra-Ourlads case
+        # where the same player appeared on the chart twice with
+        # different name variants (e.g. "Michael Penix Jr." at QB#1 and
+        # "Michael Penix" at QB#2). Same sweep also fires at the tail
+        # of Sleeper sync; running either source will clean up dupes.
+        self._merge_suffix_variant_duplicates()
         return written
 
     def get_player(self, player_id: str) -> dict[str, Any]:
@@ -1440,14 +1731,35 @@ class Database:
     def record_sync_finish(
         self,
         run_id: int,
-        players_written: int,
-        status: str,
+        players_written: int | None = None,
+        status: str = "success",
         error: str | None = None,
+        *,
+        items_fetched: int | None = None,
+        items_new: int | None = None,
+        items_matched: int | None = None,
+        items_unmatched: int | None = None,
     ) -> dict[str, Any]:
+        """Mark a sync run finished. `players_written` is set for player-data
+        syncs (sleeper, ourlads); the four `items_*` kwargs are set for feed
+        syncs. The other set is left NULL.
+        """
         self.conn.execute(
             "UPDATE sync_runs SET finished_at = ?, players_written = ?, "
-            "status = ?, error = ? WHERE id = ?",
-            (_now(), players_written, status, error, run_id),
+            "status = ?, error = ?, "
+            "items_fetched = ?, items_new = ?, items_matched = ?, items_unmatched = ? "
+            "WHERE id = ?",
+            (
+                _now(),
+                players_written,
+                status,
+                error,
+                items_fetched,
+                items_new,
+                items_matched,
+                items_unmatched,
+                run_id,
+            ),
         )
         self.conn.commit()
         row = self.conn.execute(
@@ -1478,6 +1790,344 @@ class Database:
                 (source,),
             ).fetchone()
         return _sync_run_row(row) if row else None
+
+    # --- feeds ---
+
+    def _feed_source_id(self, name: str) -> int:
+        row = self.conn.execute(
+            "SELECT id FROM feed_sources WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            # Lazy re-seed: an adapter may have been registered after this
+            # Database was opened (test scenarios, hot-reloaded modules).
+            self._seed_feed_sources()
+            row = self.conn.execute(
+                "SELECT id FROM feed_sources WHERE name = ?", (name,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"feed source {name!r} not registered")
+        return int(row["id"])
+
+    def feed_item_exists(self, source_name: str, external_id: str) -> bool:
+        """Return True if a feed_items row already exists for this
+        (source, external_id). Used by the orchestrator's `is_seen` callback
+        to drive the incremental-stop loop.
+        """
+        source_id = self._feed_source_id(source_name)
+        row = self.conn.execute(
+            "SELECT 1 FROM feed_items WHERE source_id = ? AND external_id = ? LIMIT 1",
+            (source_id, external_id),
+        ).fetchone()
+        return row is not None
+
+    def add_feed_item_with_auto_note(
+        self,
+        source_name: str,
+        item: dict[str, Any],
+        *,
+        player_id: str | None,
+        note_body: str | None = None,
+        run_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Single-transaction upsert + optional auto-note creation.
+
+        On a fresh `(source, external_id)`, inserts the feed_items row, and
+        if `player_id` is given AND `note_body` is provided, also inserts a
+        `notes` row + `note_player_mentions` link and stamps the feed_items
+        row with `note_id` and `note_run_id` — all atomically.
+
+        On a re-seen `(source, external_id)` whose existing row is unmatched
+        (`player_id IS NULL`), this method will back-match: update player_id
+        and create the auto-note in the same transaction.
+
+        Returns a dict: {feed_item_id, was_new, note_id, matched_now}. The
+        `was_new` flag means the feed_items row didn't exist; `matched_now`
+        means this call set or updated the player_id (true on first match
+        OR on back-match upgrade).
+        """
+        source_id = self._feed_source_id(source_name)
+        external_id = str(item["external_id"])
+        now = _now()
+
+        try:
+            self.conn.execute("BEGIN")
+
+            existing = self.conn.execute(
+                "SELECT id, player_id, note_id FROM feed_items "
+                "WHERE source_id = ? AND external_id = ?",
+                (source_id, external_id),
+            ).fetchone()
+
+            if existing is None:
+                cur = self.conn.execute(
+                    "INSERT INTO feed_items ("
+                    "  source_id, external_id, external_player_id,"
+                    "  external_player_name, external_team, external_position,"
+                    "  team_abbr, source_url, source_author, raw_html,"
+                    "  cleaned_text, created_at, ingested_at, player_id"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        source_id,
+                        external_id,
+                        item.get("external_player_id"),
+                        item["external_player_name"],
+                        item.get("external_team"),
+                        item.get("external_position"),
+                        item.get("team_abbr"),
+                        item.get("source_url"),
+                        item.get("source_author"),
+                        item.get("raw_html"),
+                        item["cleaned_text"],
+                        item["created_at"],
+                        now,
+                        player_id,
+                    ),
+                )
+                feed_item_id = int(cur.lastrowid)
+                was_new = True
+                matched_now = player_id is not None
+                already_has_note = False
+            else:
+                feed_item_id = int(existing["id"])
+                was_new = False
+                already_has_note = existing["note_id"] is not None
+                # Back-match: only fill in player_id if it was previously NULL.
+                if (
+                    existing["player_id"] is None
+                    and player_id is not None
+                ):
+                    self.conn.execute(
+                        "UPDATE feed_items SET player_id = ? WHERE id = ?",
+                        (player_id, feed_item_id),
+                    )
+                    matched_now = True
+                else:
+                    matched_now = False
+
+            note_id: int | None = None
+            should_write_note = (
+                matched_now
+                and player_id is not None
+                and note_body is not None
+                and not already_has_note
+            )
+            if should_write_note:
+                note_cur = self.conn.execute(
+                    "INSERT INTO notes (subject_type, subject_id, body, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("player", str(player_id), note_body, now, now),
+                )
+                note_id = int(note_cur.lastrowid)
+                self.conn.execute(
+                    "INSERT INTO note_player_mentions (note_id, player_id) VALUES (?, ?)",
+                    (note_id, player_id),
+                )
+                self.conn.execute(
+                    "UPDATE feed_items SET note_id = ?, note_run_id = ? WHERE id = ?",
+                    (note_id, run_id, feed_item_id),
+                )
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        return {
+            "feed_item_id": feed_item_id,
+            "was_new": was_new,
+            "matched_now": matched_now,
+            "note_id": note_id,
+        }
+
+    def list_feed_items(
+        self,
+        *,
+        player_id: str | None = None,
+        source: str | None = None,
+        since: str | None = None,
+        matched: bool | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Read access to the raw feed. Filters are AND-combined."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if player_id is not None:
+            clauses.append("fi.player_id = ?")
+            params.append(str(player_id))
+        if source is not None:
+            clauses.append("fs.name = ?")
+            params.append(source)
+        if since is not None:
+            clauses.append("fi.created_at >= ?")
+            params.append(since)
+        if matched is True:
+            clauses.append("fi.player_id IS NOT NULL")
+        elif matched is False:
+            clauses.append("fi.player_id IS NULL")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT fi.*, fs.name AS source_name FROM feed_items fi "
+            f"JOIN feed_sources fs ON fs.id = fi.source_id "
+            f"{where} "
+            f"ORDER BY fi.created_at DESC, fi.id DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [_feed_item_row(r, source_name=r["source_name"]) for r in rows]
+
+    def find_unmatched_feed_items_since(
+        self, *, window_days: int = 30
+    ) -> list[dict[str, Any]]:
+        """Return unmatched feed_items ingested within the window. Used by
+        the back-match pass. Only includes the fields needed to retry a match.
+        """
+        rows = self.conn.execute(
+            "SELECT id, source_id, external_player_name, team_abbr, "
+            "external_position FROM feed_items "
+            "WHERE player_id IS NULL "
+            "AND ingested_at > datetime('now', ?) "
+            "ORDER BY id ASC",
+            (f"-{int(window_days)} days",),
+        ).fetchall()
+        return [
+            {
+                "id": int(r["id"]),
+                "source_id": int(r["source_id"]),
+                "external_player_name": r["external_player_name"],
+                "team_abbr": r["team_abbr"],
+                "external_position": r["external_position"],
+            }
+            for r in rows
+        ]
+
+    def rematch_recent_unmatched_feed_items(
+        self,
+        *,
+        window_days: int = 30,
+        run_id: int | None = None,
+        note_body_for: Any = None,  # callable(item_dict) -> str | None
+    ) -> dict[str, int]:
+        """Retry identity match for recent unmatched feed_items.
+
+        For each row, runs ``find_player_for_match(normalize_full_name(name),
+        team_abbr, position)`` and on a single-match attaches the player and
+        writes the auto-note (single transaction per item via
+        ``add_feed_item_with_auto_note``'s back-match path). Returns
+        ``{checked, matched, notes_written}``.
+
+        ``note_body_for`` is an optional callable that takes the loaded
+        feed_items row dict and returns a note body string. If omitted, no
+        notes are written even when matches are found (data is still
+        attached). The orchestrator passes a closure that builds the body
+        from the full feed_items record.
+        """
+        candidates = self.find_unmatched_feed_items_since(window_days=window_days)
+        checked = 0
+        matched = 0
+        notes_written = 0
+        for cand in candidates:
+            checked += 1
+            team = cand["team_abbr"]
+            pos = cand["external_position"]
+            name = cand["external_player_name"]
+            if not (team and pos and name):
+                continue
+            normalized = normalize_full_name(name)
+            players = self.find_player_for_match(normalized, team, pos)
+            if len(players) != 1:
+                continue
+            player_id = players[0]["player_id"]
+            # Load the full feed_items row so we can rebuild the note body.
+            full = self.conn.execute(
+                "SELECT fi.*, fs.name AS source_name FROM feed_items fi "
+                "JOIN feed_sources fs ON fs.id = fi.source_id "
+                "WHERE fi.id = ?",
+                (cand["id"],),
+            ).fetchone()
+            if full is None:
+                continue
+            item_record = _feed_item_row(full, source_name=full["source_name"])
+            body: str | None = None
+            if note_body_for is not None:
+                try:
+                    body = note_body_for(item_record)
+                except Exception:
+                    body = None
+            result = self.add_feed_item_with_auto_note(
+                full["source_name"],
+                {
+                    "external_id": full["external_id"],
+                    "external_player_id": full["external_player_id"],
+                    "external_player_name": full["external_player_name"],
+                    "external_team": full["external_team"],
+                    "external_position": full["external_position"],
+                    "team_abbr": full["team_abbr"],
+                    "source_url": full["source_url"],
+                    "source_author": full["source_author"],
+                    "raw_html": full["raw_html"],
+                    "cleaned_text": full["cleaned_text"],
+                    "created_at": full["created_at"],
+                },
+                player_id=player_id,
+                note_body=body,
+                run_id=run_id,
+            )
+            if result["matched_now"]:
+                matched += 1
+            if result["note_id"] is not None:
+                notes_written += 1
+        return {"checked": checked, "matched": matched, "notes_written": notes_written}
+
+    def delete_feed_item(self, feed_item_id: int) -> None:
+        """Application-level cascade: delete the feed_items row and any
+        linked auto-note in one transaction. This is the only supported
+        delete path for feed_items rows because SQLite cannot enforce the
+        feed_items -> notes cascade with FKs.
+        """
+        try:
+            self.conn.execute("BEGIN")
+            row = self.conn.execute(
+                "SELECT note_id FROM feed_items WHERE id = ?", (int(feed_item_id),)
+            ).fetchone()
+            if row is None:
+                self.conn.rollback()
+                raise NotFoundError(f"feed_item {feed_item_id} not found")
+            note_id = row["note_id"]
+            self.conn.execute(
+                "DELETE FROM feed_items WHERE id = ?", (int(feed_item_id),)
+            )
+            if note_id is not None:
+                self.conn.execute("DELETE FROM notes WHERE id = ?", (int(note_id),))
+            self.conn.commit()
+        except NotFoundError:
+            raise
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_auto_notes_from_run(self, run_id: int) -> int:
+        """Bulk-rollback for a misfiring feed sync. Deletes every auto-note
+        whose backing feed_items row was first-attached during the given
+        sync run. Leaves the raw feed_items rows alive (their `note_id`
+        gets set to NULL via the FK ON DELETE SET NULL). Idempotent.
+        Non-feed run_ids are no-ops because they never set note_run_id.
+        """
+        # Collect note_ids first so we can both delete and report a count.
+        note_ids = [
+            int(r["note_id"])
+            for r in self.conn.execute(
+                "SELECT note_id FROM feed_items "
+                "WHERE note_run_id = ? AND note_id IS NOT NULL",
+                (int(run_id),),
+            ).fetchall()
+        ]
+        if not note_ids:
+            return 0
+        marks = ",".join("?" for _ in note_ids)
+        self.conn.execute(
+            f"DELETE FROM notes WHERE id IN ({marks})", tuple(note_ids)
+        )
+        self.conn.commit()
+        return len(note_ids)
 
     def close(self) -> None:
         self.conn.close()

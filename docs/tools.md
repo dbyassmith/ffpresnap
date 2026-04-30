@@ -1,12 +1,27 @@
 # MCP tools reference
 
-ffpresnap exposes 21 tools to Claude. You don't need to call these directly — Claude picks the right one when you describe what you want — but it's useful to know what's available.
+ffpresnap exposes 24 tools to Claude. You don't need to call these directly — Claude picks the right one when you describe what you want — but it's useful to know what's available.
 
 ## Sync
 
-- `sync_players(source?)` — pull current player data from a source. `source` is `"sleeper"` (default, ~5s, returns full summary synchronously) or `"ourlads"` (~1-3 min, runs in a background thread and returns a `run_id` immediately). Sleeper sync overwrites every Sleeper-sourced row; Ourlads sync merges into existing rows by name+team+position and binds `ourlads_id` for stability across runs.
-- `last_sync(source?)` — show the most recent sync run. Optional `source` restricts to runs of that source (`"sleeper"` or `"ourlads"`).
-- `get_sync_status(run_id)` — read a `sync_runs` row by id. Use after starting an Ourlads sync to poll for completion; the row's `status` becomes `"success"` or `"error"` when the background run finishes. Per-team failures (parse, sanity, network) land in the `error` column.
+- `sync(source, full?)` — pull data from a source and merge it locally. `source` is one of:
+  - `"sleeper"` — player data, ~5s, runs synchronously and returns the full summary.
+  - `"ourlads"` — depth charts, ~1-3 min, runs in a background thread and returns `{run_id, status: "running", source}` immediately.
+  - any registered feed source (e.g. `"32beatwriters"`) — paginated beat-reporter content, runs in a background thread, returns a `run_id`.
+
+  Feed sources also accept `full: true` to walk the entire feed (first-run backfill or reconciliation against API drift). The default is incremental: stop at the first page where every item is already known.
+
+  Sleeper sync overwrites every Sleeper-sourced row. Ourlads sync merges into existing rows by name+team+position and binds `ourlads_id` for stability across runs. Feed syncs store raw items in `feed_items` and auto-create one note per matched item.
+- `last_sync(source?)` — show the most recent sync run. Optional `source` restricts to runs of that source.
+- `get_sync_status(run_id)` — read a `sync_runs` row by id. Use after starting a background sync to poll for completion; the row's `status` becomes `"success"` or `"error"` when the background run finishes. Feed-sync rows include `items_fetched`, `items_new`, `items_matched`, `items_unmatched`. Per-team Ourlads failures (parse, sanity, network) land in the `error` column.
+
+## Feeds (read & maintenance)
+
+- `list_feed_items(player_id?, source?, since?, matched?, limit?)` — list raw feed items. Filters AND-combine: `player_id` restricts to items attached to one player, `source` to one feed (e.g. `"32beatwriters"`), `since` is an ISO lower bound on `created_at`, `matched: true|false` filters by whether the item is linked to a player. `limit` defaults to 50.
+- `rematch_feed_items(window_days?)` — retry identity matching for unmatched items ingested in the last N days (default 30). Useful after a Sleeper or Ourlads sync brings in players that were previously unknown — the same pass runs at the tail of every sync, but you can also trigger it manually. Returns `{checked, matched, notes_written}`.
+- `delete_auto_notes_from_run(run_id)` — bulk-rollback for a misfiring feed sync. Deletes every auto-note whose backing `feed_items` row was first-attached during the given sync run; leaves the raw `feed_items` rows alive (their `note_id` becomes NULL). Idempotent — calling twice returns 0 the second time. Non-feed run IDs are no-ops. Returns `{deleted_notes: N}`.
+
+> **Note on idempotency:** auto-notes deleted via the regular `delete_note` tool (or via `delete_auto_notes_from_run`) are *not* recreated on the next sync — the `feed_items` row already exists, so the sync short-circuits. This is intentional: it means manually deleted notes stay deleted across daily syncs.
 
 ## Browse
 

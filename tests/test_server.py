@@ -63,18 +63,18 @@ def synced_db(db, monkeypatch):
         ),
     }
     monkeypatch.setattr(sleeper_module, "fetch_players", lambda url: payload)
-    handle_tool_call(db, "sync_players", {})
+    handle_tool_call(db, "sync", {"source": "sleeper"})
     return db
 
 
 # --- sync / last_sync ---
 
 
-def test_sync_players_writes_and_records(db, monkeypatch):
+def test_sync_writes_and_records(db, monkeypatch):
     monkeypatch.setattr(
         sleeper_module, "fetch_players", lambda url: {"1": _sleeper_player("1")}
     )
-    summary = handle_tool_call(db, "sync_players", {})
+    summary = handle_tool_call(db, "sync", {"source": "sleeper"})
     assert summary["status"] == "success"
     assert summary["players_written"] == 1
     last = handle_tool_call(db, "last_sync", {})
@@ -85,16 +85,16 @@ def test_last_sync_none_initially(db):
     assert handle_tool_call(db, "last_sync", {}) is None
 
 
-def test_sync_players_explicit_sleeper_source(db, monkeypatch):
+def test_sync_explicit_sleeper_source(db, monkeypatch):
     monkeypatch.setattr(
         sleeper_module, "fetch_players", lambda url: {"1": _sleeper_player("1")}
     )
-    summary = handle_tool_call(db, "sync_players", {"source": "sleeper"})
+    summary = handle_tool_call(db, "sync", {"source": "sleeper"})
     assert summary["status"] == "success"
     assert summary["source"] == "sleeper"
 
 
-def test_sync_players_ourlads_source_runs_in_background(db, monkeypatch):
+def test_sync_ourlads_source_runs_in_background(db, monkeypatch):
     """Ourlads sync starts a background thread and returns a run_id. With
     fixture-backed fetcher, the run completes successfully in <2s."""
     from pathlib import Path
@@ -113,7 +113,7 @@ def test_sync_players_ourlads_source_runs_in_background(db, monkeypatch):
     monkeypatch.setattr(ourlads_module, "_default_fetch", fake_fetch)
     monkeypatch.setattr(ourlads_module, "DEFAULT_DELAY_SECONDS", 0.0)
 
-    summary = handle_tool_call(db, "sync_players", {"source": "ourlads"})
+    summary = handle_tool_call(db, "sync", {"source": "ourlads"})
     assert summary["source"] == "ourlads"
     # Status may be 'running' or 'success' depending on timing.
     assert summary["status"] in ("running", "success")
@@ -142,7 +142,7 @@ def test_last_sync_filters_by_source_via_mcp(db, monkeypatch):
     monkeypatch.setattr(
         sleeper_module, "fetch_players", lambda url: {"1": _sleeper_player("1")}
     )
-    handle_tool_call(db, "sync_players", {"source": "sleeper"})
+    handle_tool_call(db, "sync", {"source": "sleeper"})
     sleeper_run = handle_tool_call(db, "last_sync", {"source": "sleeper"})
     assert sleeper_run is not None
     assert sleeper_run["source"] == "sleeper"
@@ -165,7 +165,7 @@ def test_concurrent_sync_raises_tool_error(db, monkeypatch):
     )
     db.conn.commit()
     with pytest.raises(ToolError) as exc:
-        handle_tool_call(db, "sync_players", {"source": "ourlads"})
+        handle_tool_call(db, "sync", {"source": "ourlads"})
     assert "already running" in str(exc.value)
 
 
